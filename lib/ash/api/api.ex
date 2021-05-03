@@ -123,6 +123,48 @@ defmodule Ash.Api do
       page when refreshing data, to avoid pages jittering.
       """
     ],
+    load: [
+      type: :any,
+      doc: """
+      A map of relationship load path to pagination options that should be supplied to the reads for those
+      loads. This could (depending on the pagination configuration of the `read_action` for that resource),
+      cause the value of the relationship to be a `page` struct, e.g `%Ash.Page.Offset{}` or `%Ash.Page.Keyset{}`.
+      By default, pagination is *bypassed* when loading related data, so if you want to paginate the loaded
+      relationship it has to be in this map, even if you aren't supplying specific pagination parameters. For example:
+
+      ```elixir
+      Post
+      |> Ash.Query.load(comments: [:author, subcomments: :author])
+      |> MyApi.read!(page: [
+        load: %{
+          [:comments] => []
+          [:comments, :subcomments] => [limit: 10, offset: 20]
+        }
+      ])
+      ```
+
+      Keep in mind that there is no way to specify different pagination options for different records in the result. So if you
+      want to subsequently go to the next page of a single one of the comments (but not all of them), you will most likely want to
+      do something like this:
+
+      ```elixir
+      posts =
+        Post
+        |> Ash.Query.load(comments: [:author, subcomments: :author])
+        |> MyApi.read!(page: [
+          load: %{
+            [:comments] => []
+            [:comments, :subcomments] => [limit: 10, offset: 20]
+          }
+        ])
+        ```
+
+      first_post_comments = List.first(post).comments
+
+      MyApi.page(comments, :next)
+      ```
+      """
+    ],
     count: [
       type: :boolean,
       doc: "Whether or not to return the page with a full count of all records"
@@ -149,6 +191,15 @@ defmodule Ash.Api do
     count: [
       type: :boolean,
       doc: "Whether or not to return the page with a full count of all records"
+    ],
+    load: [
+      type: :any,
+      doc: """
+      A map of relationship load path to pagination options that should be supplied to the reads for those
+      loads.
+
+      See the offset options for a better explanation of this option.
+      """
     ]
   ]
 
@@ -167,7 +218,25 @@ defmodule Ash.Api do
         end
       end
     end
+    |> sanitize_load_opts()
   end
+
+  defp sanitize_load_opts({:ok, opts}) when is_list(opts) do
+    if Keyword.has_key?(opts, :load) do
+      {:ok,
+       Keyword.update!(opts, :load, fn load ->
+         if is_list(load) do
+           Map.new(load, fn {key, value} -> {List.wrap(key), value} end)
+         else
+           load
+         end
+       end)}
+    else
+      {:ok, opts}
+    end
+  end
+
+  defp sanitize_load_opts(other), do: other
 
   defp validate_or_error(opts, schema) do
     case Ash.OptionsHelpers.validate(opts, schema) do
@@ -176,7 +245,14 @@ defmodule Ash.Api do
     end
   end
 
-  @load_opts_schema merge_schemas([], @global_opts, "Global Options")
+  @load_opts_schema [
+                      page: [
+                        doc:
+                          "Nested pagination options. The only relevant option is `load`, as the root resource is not fetched when loading.",
+                        type: {:custom, __MODULE__, :page_opts, []}
+                      ]
+                    ]
+                    |> merge_schemas(@global_opts, "Global Options")
 
   @get_opts_schema [
                      load: [
@@ -194,6 +270,11 @@ defmodule Ash.Api do
                      context: [
                        type: :any,
                        doc: "Context to be set on the query being run"
+                     ],
+                     page: [
+                       doc:
+                         "Nested pagination options. The only relevant option is `load`, as `get` never paginates the root resource.",
+                       type: {:custom, __MODULE__, :page_opts, []}
                      ]
                    ]
                    |> merge_schemas(@global_opts, "Global Options")
@@ -480,8 +561,14 @@ defmodule Ash.Api do
           query
         end
 
+      read_opts =
+        opts
+        |> Keyword.take(Keyword.keys(@read_opts_schema))
+        |> Keyword.put_new(:page, [])
+        |> Keyword.update!(:page, &Keyword.take(&1, [:load]))
+
       query
-      |> api.read(Keyword.take(opts, Keyword.keys(@read_opts_schema)))
+      |> api.read(read_opts)
       |> case do
         {:ok, %{results: [single_result]}} ->
           {:ok, single_result}
@@ -690,6 +777,11 @@ defmodule Ash.Api do
     with %{valid?: true} <- query,
          {:ok, action} <- get_action(query.resource, opts, :read, query.action),
          {:ok, opts} <- Ash.OptionsHelpers.validate(opts, @load_opts_schema) do
+      opts =
+        opts
+        |> Keyword.put_new(:page, [])
+        |> Keyword.update!(:page, &Keyword.take(&1, [:load]))
+
       Read.run(query, action, Keyword.put(opts, :initial_data, data))
     else
       {:error, error} ->

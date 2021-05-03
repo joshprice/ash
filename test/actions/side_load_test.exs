@@ -41,7 +41,14 @@ defmodule Ash.Test.Actions.SideLoadTest do
     end
 
     actions do
-      read :read
+      read :read do
+        primary? true
+      end
+
+      read :paginate do
+        pagination offset?: true, default_limit: 1
+      end
+
       create :create
     end
 
@@ -106,6 +113,12 @@ defmodule Ash.Test.Actions.SideLoadTest do
         through: PostCategory,
         destination_field_on_join_table: :post_id,
         source_field_on_join_table: :category_id
+
+      many_to_many :paginated_posts, Post,
+        through: PostCategory,
+        destination_field_on_join_table: :post_id,
+        source_field_on_join_table: :category_id,
+        read_action: :paginate
     end
   end
 
@@ -220,5 +233,52 @@ defmodule Ash.Test.Actions.SideLoadTest do
 
       assert [%{posts: [%{id: ^post_id}]}, %{posts: [%{id: ^post_id}]}] = post.categories
     end
+  end
+
+  test "it paginates side loads properly" do
+    category1 =
+      Category
+      |> new(%{name: "lame"})
+      |> Api.create!()
+
+    category2 =
+      Category
+      |> new(%{name: "cool"})
+      |> Api.create!()
+
+    Post
+    |> new(%{title: "aaa"})
+    |> replace_relationship(:categories, [category1])
+    |> Api.create!()
+
+    Post
+    |> new(%{title: "bbb"})
+    |> replace_relationship(:categories, [category1])
+    |> Api.create!()
+
+    Post
+    |> new(%{title: "aaa"})
+    |> replace_relationship(:categories, [category2])
+    |> Api.create!()
+
+    Post
+    |> new(%{title: "bbb"})
+    |> replace_relationship(:categories, [category2])
+    |> Api.create!()
+
+    post_query =
+      Post
+      |> Ash.Query.sort(:title)
+
+    result =
+      Category
+      |> Ash.Query.load(paginated_posts: post_query)
+      |> Ash.Query.sort(:name)
+      |> Api.read!(paginate_loads?: true)
+
+    assert [
+             %{name: "cool", paginated_posts: %Ash.Page.Offset{results: [%{title: "aaa"}]}},
+             %{name: "lame", paginated_posts: %Ash.Page.Offset{results: [%{title: "aaa"}]}}
+           ] = result
   end
 end

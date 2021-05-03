@@ -3,6 +3,32 @@ defmodule Ash.Actions.PaginationTest do
 
   require Ash.Query
 
+  defmodule Post do
+    use Ash.Resource, data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    actions do
+      read :read do
+        pagination offset?: true
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :title, :string
+    end
+
+    relationships do
+      belongs_to :user, Ash.Actions.PaginationTest.User
+
+      has_many :favorited_by_users, Ash.Actions.PaginationTest.User,
+        destination_field: :favorite_post_id
+    end
+  end
+
   defmodule User do
     @moduledoc false
     use Ash.Resource, data_layer: Ash.DataLayer.Ets
@@ -61,6 +87,11 @@ defmodule Ash.Actions.PaginationTest do
       uuid_primary_key :id
       attribute :name, :string
     end
+
+    relationships do
+      has_many :posts, Post
+      belongs_to :favorite_post, Post
+    end
   end
 
   defmodule Api do
@@ -68,6 +99,7 @@ defmodule Ash.Actions.PaginationTest do
 
     resources do
       resource User
+      resource Post
     end
   end
 
@@ -378,6 +410,51 @@ defmodule Ash.Actions.PaginationTest do
       for result <- Api.read!(User, action: :both_optional, page: [limit: 10]).results do
         refute is_nil(result.__metadata__.keyset)
       end
+    end
+  end
+
+  describe "paginating relationships" do
+    setup do
+      user1 = Api.create!(Ash.Changeset.new(User, %{name: "user1"}))
+      user2 = Api.create!(Ash.Changeset.new(User, %{name: "user2"}))
+      user3 = Api.create!(Ash.Changeset.new(User, %{name: "user3"}))
+      user4 = Api.create!(Ash.Changeset.new(User, %{name: "user4"}))
+
+      Post
+      |> Ash.Changeset.new(title: "post1")
+      |> Ash.Changeset.replace_relationship(:favorited_by_users, [user1, user2])
+      |> Ash.Changeset.replace_relationship(:user, user1)
+      |> Api.create!()
+
+      Post
+      |> Ash.Changeset.new(title: "post2")
+      |> Ash.Changeset.replace_relationship(:user, user2)
+      |> Api.create!()
+
+      Post
+      |> Ash.Changeset.new(title: "post3")
+      |> Ash.Changeset.replace_relationship(:favorited_by_users, [user3, user4])
+      |> Ash.Changeset.replace_relationship(:user, user1)
+      |> Api.create!()
+
+      :ok
+    end
+
+    test "simple pagination works" do
+      posts_query = Ash.Query.sort(Post, :title)
+
+      page =
+        User
+        |> Ash.Query.load(posts: posts_query)
+        |> Ash.Query.sort(:name)
+        |> Api.read!(page: [limit: 2, load: [posts: [limit: 1]]])
+
+      assert %Ash.Page.Offset{
+               results: [
+                 %{name: "user1", posts: %Ash.Page.Offset{results: [%{title: "post1"}]}},
+                 %{name: "user2", posts: %Ash.Page.Offset{results: [%{title: "post2"}]}}
+               ]
+             } = page
     end
   end
 end
