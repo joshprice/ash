@@ -1842,7 +1842,7 @@ defmodule Ash.Changeset do
     end
   end
 
-  defp handle_indexed_maps({:array, type}, term) when is_map(term) and term != %{} do
+  defp handle_indexed_maps({:array, type}, term) when is_map(term) do
     term
     |> Enum.reduce_while({:ok, []}, fn
       {key, value}, {:ok, acc} when is_integer(key) ->
