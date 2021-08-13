@@ -473,7 +473,7 @@ defmodule Ash.Test.Filter.FilterTest do
       assert Filter.strict_subset_of?(filter, candidate)
     end
 
-    test "doesnt have false positives on less than and greater than closing in on a single value" do
+    test "doesnt have false positives on less than and greater than closing in on a single value out of range" do
       filter = Filter.parse!(Post, points: [greater_than: 1, less_than: 3])
 
       candidate = Filter.parse!(Post, points: 4)

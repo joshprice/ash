@@ -627,18 +627,32 @@ defmodule Ash.SatSolver do
     |> negations_to_negative_numbers()
     |> Enum.uniq()
     |> solve()
-    |> Picosat.solve()
     |> solutions_to_predicate_values(bindings)
   end
 
-  if Code.ensure_loaded?(Picosat) do
-    def solve(expression) do
-      Picosat.solve(expression)
-    end
-  else
-    def solve(expression) do
-      Ash.SatSolver.Csp.solve(expression)
-    end
+  cond do
+    Code.ensure_loaded?(Picosat) ->
+      def solve(expression) do
+        Picosat.solve(expression)
+      end
+
+    Code.ensure_loaded?(Csp) ->
+      def solve(expression) do
+        Ash.SatSolver.Csp.solve(expression)
+      end
+
+    true ->
+      raise """
+      No SatSolver library found. Please configure which one you would like to use, by including one of the following dependencies:
+
+              {:picosat_elixir, "~> 0.1.5"}
+              {:csp, "~> 0.1.0"}
+
+      `csp` is a native elixir solution, so if you are having trouble with nmake/compiling picosat_elixir,
+      you can use `csp` as a workaround. *However*, it is not as heavily used as picosat_elixir, so it is
+      advised that you take extra care around testing your authorization scenarios, if using `ash_policy_authorizer`,
+      as it heavily uses the sat solver library you've chosen.
+      """
   end
 
   defp solutions_to_predicate_values({:ok, solution}, bindings) do

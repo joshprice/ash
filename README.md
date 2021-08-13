@@ -17,7 +17,8 @@ Ash is in alpha. The package version is 1.0.0+, and most of the time that means 
 ```elixir
 def deps do
   [
-    {:ash, "~> 1.29.0-rc0"}
+    {:ash, "~> 1.29.0-rc0"},
+    {:picosat_elixir, "~> 0.1.5"} # See the nmake/picosat troubleshooting guide if this gives you trouble
   ]
 end
 ```
