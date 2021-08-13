@@ -2,28 +2,10 @@ defmodule Ash.Changeset do
   @moduledoc """
   Changesets are used to create and update data in Ash.
 
-  Create a changeset with `create/2` or `update/2`, and alter the attributes
+  Create a changeset with `new/1` or `new/2`, and alter the attributes
   and relationships using the functions provided in this module.  Nothing in this module
   actually incurs changes in a data layer. To commit a changeset, see `c:Ash.Api.create/2`
   and `c:Ash.Api.update/2`.
-
-  ## Primary Keys
-
-  For relationship manipulation using `append_to_relationship/3`, `remove_from_relationship/3`
-  and `replace_relationship/3` there are three types that can be used for primary keys:
-
-
-  1.) An instance of the resource in question.
-
-  2.) If the primary key is just a single field, i.e `:id`, then a single value, i.e `1`
-
-  3.) A map of keys to values representing the primary key, i.e `%{id: 1}` or `%{id: 1, org_id: 2}`
-
-  ## Join Attributes
-
-  For many to many relationships, the attributes on a join relationship may be set while relating items
-  by passing a tuple of the primary key and the changes to be applied. This is done via upserts, so
-  update validations on the join resource are *not* applied, but create validations are.
 
   For example:
 
@@ -34,12 +16,27 @@ defmodule Ash.Changeset do
     {%{id: 2}, %{link_type: "related_to"}}
   ])
   ```
+
+  `Ash.Changeset.replace_relationship/3`, `Ash.Changeset.append_to_relationship/3` and `Ash.Changeset.remove_from_relationship/3`
+  are simply about managing what data is/isn't related. A simple example might be updating the *tags* of a post, where all the tags
+  already exist, we simply want to edit the information. They are shorthands for calling `Ash.Changeset.manage_relationship/4` with
+  a specific set of options.
+
+  See the action DSL documentation for more.
   """
   defstruct [
     :data,
     :action_type,
+    :action,
     :resource,
     :api,
+    :tenant,
+    :__validated_for_action__,
+    :handle_errors,
+    select: nil,
+    params: %{},
+    action_failed?: false,
+    arguments: %{},
     context: %{},
     after_action: [],
     before_action: [],
@@ -47,22 +44,41 @@ defmodule Ash.Changeset do
     valid?: true,
     attributes: %{},
     relationships: %{},
-    change_dependencies: [],
-    requests: []
+    change_dependencies: []
   ]
 
   defimpl Inspect do
     import Inspect.Algebra
 
     def inspect(changeset, opts) do
+      context = Map.delete(changeset.context, :private)
+
+      context =
+        if context == %{} do
+          empty()
+        else
+          concat("context: ", to_doc(sanitize_context(context), opts))
+        end
+
+      tenant =
+        if changeset.tenant do
+          concat("tenant: ", to_doc(changeset.tenant, opts))
+        else
+          empty()
+        end
+
       container_doc(
         "#Ash.Changeset<",
         [
           concat("action_type: ", inspect(changeset.action_type)),
+          concat("action: ", inspect(changeset.action && changeset.action.name)),
+          tenant,
           concat("attributes: ", to_doc(changeset.attributes, opts)),
           concat("relationships: ", to_doc(changeset.relationships, opts)),
+          arguments(changeset, opts),
           concat("errors: ", to_doc(changeset.errors, opts)),
           concat("data: ", to_doc(changeset.data, opts)),
+          context,
           concat("valid?: ", to_doc(changeset.valid?, opts))
         ],
         ">",
@@ -70,40 +86,825 @@ defmodule Ash.Changeset do
         fn str, _ -> str end
       )
     end
+
+    defp sanitize_context(%{manage_relationship_source: manage_relationship_source} = context) do
+      sanitized_managed_relationship_source =
+        manage_relationship_source
+        |> Enum.reverse()
+        |> Enum.map(fn {resource, rel, _} ->
+          "#{inspect(resource)}.#{rel}"
+        end)
+        |> Enum.join(" -> ")
+
+      %{
+        context
+        | manage_relationship_source:
+            "#manage_relationship_source<#{sanitized_managed_relationship_source}>"
+      }
+    end
+
+    defp sanitize_context(context), do: context
+
+    defp arguments(changeset, opts) do
+      if changeset.action do
+        if Enum.empty?(changeset.action.arguments) do
+          empty()
+        else
+          arg_string =
+            changeset.action.arguments
+            |> Enum.filter(fn argument ->
+              match?({:ok, _}, Ash.Changeset.fetch_argument(changeset, argument.name))
+            end)
+            |> Map.new(fn argument ->
+              if argument.sensitive? do
+                {argument.name, "**redacted**"}
+              else
+                {argument.name, Ash.Changeset.get_argument(changeset, argument.name)}
+              end
+            end)
+            |> to_doc(opts)
+
+          concat(["arguments: ", arg_string])
+        end
+      else
+        empty()
+      end
+    end
   end
 
-  @type t :: %__MODULE__{}
+  @type t :: %__MODULE__{data: Ash.Resource.record()}
 
   alias Ash.Error.{
+    Changes.InvalidArgument,
     Changes.InvalidAttribute,
+    Changes.InvalidChanges,
     Changes.InvalidRelationship,
     Changes.NoSuchAttribute,
     Changes.NoSuchRelationship,
+    Changes.Required,
     Invalid.NoSuchResource
   }
 
-  @doc "Return a changeset over a resource or a record"
-  @spec new(Ash.resource() | Ash.record(), initial_attributes :: map) :: t
-  def new(resource, initial_attributes \\ %{})
+  @doc """
+  Return a changeset over a resource or a record. `params` can be either attributes, relationship values or arguments.
 
-  def new(%resource{} = record, initial_attributes) do
-    if Ash.Resource.resource?(resource) do
+  If you are using external input, you almost certainly want to use `Ash.Changeset.for_<action_type>`. However, you can
+  use `Ash.Changeset.new/2` to start a changeset and make a few changes prior to calling `for_action`. For example:
+
+  ```elixir
+  Ash.Changeset.new()
+  |> Ash.Changeset.change_attribute(:name, "foobar")
+  |> Ash.Changeset.for_action(...)
+  ```
+
+  Anything that is modified prior to `for_action` is validated against the rules of the action, while *anything after it is not*.
+
+  This changeset does not consider an action, and so allows you to change things with minimal validation. Values are
+  validated when changed, and the existence of attributes and relationships are validated. If you want to essentially
+  "run an action", and get back a changeset with any errors that would be generated by that action (with the exception
+  of errors that can only be generated by the data layer), use `for_action/4`.
+
+  Additionally, this format only supports supplying attributes in the params. This is because we don't know what the
+  behavior should be for relationship changes, nor what arguments are available. You can manage them yourself with
+  the functions that allow managing arguments/relationships that are provided in this module, e.g `set_argument/3` and
+  `replace_relationship/3`
+  """
+  @spec new(Ash.Resource.t() | Ash.Resource.record(), params :: map) :: t
+  def new(resource, params \\ %{})
+
+  def new(%resource{} = record, params) do
+    tenant =
+      record
+      |> Map.get(:__metadata__, %{})
+      |> Map.get(:tenant, nil)
+
+    context = Ash.Resource.Info.default_context(resource) || %{}
+
+    if Ash.Resource.Info.resource?(resource) do
       %__MODULE__{resource: resource, data: record, action_type: :update}
-      |> change_attributes(initial_attributes)
+      |> change_attributes(params)
+      |> set_context(context)
+      |> set_tenant(tenant)
+    else
+      %__MODULE__{
+        resource: resource,
+        action_type: :update,
+        data: struct(resource)
+      }
+      |> add_error(NoSuchResource.exception(resource: resource))
+      |> set_tenant(tenant)
+      |> set_context(context)
+    end
+  end
+
+  def new(resource, params) do
+    if Ash.Resource.Info.resource?(resource) do
+      %__MODULE__{
+        resource: resource,
+        action_type: :create,
+        data: struct(resource)
+      }
+      |> change_attributes(params)
     else
       %__MODULE__{resource: resource, action_type: :create, data: struct(resource)}
       |> add_error(NoSuchResource.exception(resource: resource))
     end
   end
 
-  def new(resource, initial_attributes) do
-    if Ash.Resource.resource?(resource) do
-      %__MODULE__{resource: resource, action_type: :create, data: struct(resource)}
-      |> change_attributes(initial_attributes)
+  @doc """
+  Ensure that only the specified attributes are present in the results.
+
+  The first call to `select/2` will replace the default behavior of selecting
+  all attributes. Subsequent calls to `select/2` will combine the provided
+  fields unless the `replace?` option is provided with a value of `true`.
+
+  If a field has been deselected, selecting it again will override that (because a single list of fields is tracked for selection)
+
+  Primary key attributes always selected and cannot be deselected.
+
+  When attempting to load a relationship (or manage it with `Ash.Changeset.manage_relationship/3`),
+  if the source field is not selected on the query/provided data an error will be produced. If loading
+  a relationship with a query, an error is produced if the query does not select the destination field
+  of the relationship.
+
+  Datalayers currently are not notified of the `select` for a changeset(unlike queries), and creates/updates select all fields when they are performed.
+  A select provided on a changeset simply sets the unselected fields to `nil` before returning the result.
+
+  Use `ensure_selected/2` if you simply wish to make sure a field has been selected, without deselecting any other fields.
+  """
+  def select(changeset, fields, opts \\ []) do
+    if opts[:replace?] do
+      %{changeset | select: Enum.uniq(List.wrap(fields))}
     else
-      %__MODULE__{resource: resource, action_type: :create, data: struct(resource)}
-      |> add_error(NoSuchResource.exception(resource: resource))
+      %{changeset | select: Enum.uniq(List.wrap(fields) ++ (changeset.select || []))}
     end
+  end
+
+  @doc """
+  Ensures that the given attributes are selected.
+
+  The first call to `select/2` will *limit* the fields to only the provided fields.
+  Use `ensure_selected/2` to say "select this field (or these fields) without deselecting anything else".
+
+  See `select/2` for more.
+  """
+  def ensure_selected(changeset, fields) do
+    if changeset.select do
+      Ash.Changeset.select(changeset, List.wrap(fields))
+    else
+      to_select =
+        changeset.resource
+        |> Ash.Resource.Info.attributes()
+        |> Enum.map(& &1.name)
+
+      Ash.Changeset.select(changeset, to_select)
+    end
+  end
+
+  @doc """
+  Ensure the the specified attributes are `nil` in the changeset results.
+  """
+  def deselect(changeset, fields) do
+    select =
+      if changeset.select do
+        changeset.select
+      else
+        changeset.resource
+        |> Ash.Resource.Info.attributes()
+        |> Enum.map(& &1.name)
+      end
+
+    select = select -- List.wrap(fields)
+
+    select(changeset, select, replace?: true)
+  end
+
+  def selecting?(changeset, field) do
+    case changeset.select do
+      nil ->
+        not is_nil(Ash.Resource.Info.attribute(changeset.resource, field))
+
+      select ->
+        if field in select do
+          true
+        else
+          attribute = Ash.Resource.Info.attribute(changeset.resource, field)
+
+          attribute && (attribute.private? || attribute.primary_key?)
+        end
+    end
+  end
+
+  @manage_types [:replace, :append, :remove, :direct_control, :create]
+
+  @for_create_opts [
+    relationships: [
+      type: :any,
+      doc: """
+      customize relationship behavior.
+
+      By default, any relationships are ignored. There are three ways to change relationships with this function:
+
+      ### Action Arguments (preferred)
+
+      Create an argument on the action and add a `Ash.Resource.Change.Builtins.manage_relationship/3` change to the action.
+
+      ### Overrides
+
+      You can pass the `relationships` option to specify the behavior. It is a keyword list of relationship and either
+        * one of the preset manage types: #{inspect(@manage_types)}
+        * explicit options, in the form of `{:manage, [...opts]}`
+
+      ```elixir
+      Ash.Changeset.for_create(MyResource, :create, params, relationships: [relationship: :append, other_relationship: {:manage, [...opts]}])
+      ```
+
+      You can also use explicit calls to `manage_relationship/4`.
+      """
+    ],
+    require?: [
+      type: :boolean,
+      default: false,
+      doc:
+        "If set to `true`, values are only required when the action is run (instead of immediately)."
+    ],
+    actor: [
+      type: :any,
+      doc:
+        "set the actor, which can be used in any `Ash.Resource.Change`s configured on the action. (in the `context` argument)"
+    ],
+    tenant: [
+      type: :any,
+      doc: "set the tenant on the changeset"
+    ]
+  ]
+
+  @doc false
+  def for_create_opts, do: @for_create_opts
+
+  @doc """
+  Constructs a changeset for a given create action, and validates it.
+
+  Anything that is modified prior to `for_create/4` is validated against the rules of the action, while *anything after it is not*.
+  This runs any `change`s contained on your action. To have your logic execute *only* during the action, you can use `after_action/2`
+  or `before_action/2`.
+
+  Multitenancy is *not* validated until an action is called. This allows you to avoid specifying a tenant until just before calling
+  the api action.
+
+  ### Params
+  `params` may be attributes, relationships, or arguments. You can safely pass user/form input directly into this function.
+  Only public attributes and relationships are supported. If you want to change private attributes as well, see the
+  Customization section below. `params` are stored directly as given in the `params` field of the changeset, which is used
+
+  ### Opts
+
+  #{Ash.OptionsHelpers.docs(@for_create_opts)}
+
+  ### Customization
+
+  A changeset can be provided as the first argument, instead of a resource, to allow
+  setting specific attributes ahead of time.
+
+  For example:
+
+      MyResource
+      |> Ash.Changeset.new()
+      |> Ash.Changeset.change_attribute(:foo, 1)
+      |> Ash.Changeset.for_create(:create, ...opts)
+
+  Once a changeset has been validated by `for_create/4` (or `for_update/4`), it isn't validated again in the action.
+  New changes added are validated individually, though. This allows you to create a changeset according
+  to a given action, and then add custom changes if necessary.
+  """
+  def for_create(initial, action, params \\ %{}, opts \\ []) do
+    changeset =
+      case initial do
+        %__MODULE__{action_type: :create} = changeset ->
+          changeset
+
+        resource when is_atom(resource) ->
+          new(resource)
+
+        other ->
+          raise ArgumentError,
+            message: """
+            Initial must be a changeset with the action type of `:create`, or a resource.
+
+            Got: #{inspect(other)}
+            """
+      end
+
+    for_action(changeset, action, params, opts)
+  end
+
+  @doc """
+  Constructs a changeset for a given update action, and validates it.
+
+  Anything that is modified prior to `for_update/4` is validated against the rules of the action, while *anything after it is not*.
+
+  See `for_create/4` for more information
+  """
+  def for_update(initial, action, params \\ %{}, opts \\ []) do
+    changeset =
+      case initial do
+        # We accept :destroy here to support soft deletes
+        %__MODULE__{action_type: type} = changeset when type in [:update, :destroy] ->
+          changeset
+
+        %mod{} = struct when mod != __MODULE__ ->
+          new(struct)
+
+        other ->
+          raise ArgumentError,
+            message: """
+            Initial must be a changeset with the action type of `:update` or `:destroy`, or a record.
+
+            Got: #{inspect(other)}
+            """
+      end
+
+    for_action(changeset, action, params, opts)
+  end
+
+  @doc """
+  Constructs a changeset for a given destroy action, and validates it.
+
+  ### Opts
+
+  * `:actor` - set the actor, which can be used in any `Ash.Resource.Change`s configured on the action. (in the `context` argument)
+  * `:tenant` - set the tenant on the changeset
+
+  Anything that is modified prior to `for_destroy/4` is validated against the rules of the action, while *anything after it is not*.
+
+  Once a changeset has been validated by `for_destroy/4`, it isn't validated again in the action.
+  New changes added are validated individually, though. This allows you to create a changeset according
+  to a given action, and then add custom changes if necessary.
+  """
+  def for_destroy(initial, action_name, params \\ %{}, opts \\ []) do
+    changeset =
+      case initial do
+        %__MODULE__{} = changeset ->
+          changeset
+          |> Map.put(:action_type, :destroy)
+
+        %_{} = struct ->
+          struct
+          |> new()
+          |> Map.put(:action_type, :destroy)
+
+        other ->
+          raise ArgumentError,
+            message: """
+            Initial must be a changeset with the action type of `:destroy`, or a record.
+
+            Got: #{inspect(other)}
+            """
+      end
+
+    if changeset.valid? do
+      action = Ash.Resource.Info.action(changeset.resource, action_name, changeset.action_type)
+
+      if action do
+        changeset
+        |> handle_errors(action.error_handler)
+        |> set_actor(opts)
+        |> set_tenant(opts[:tenant] || changeset.tenant)
+        |> Map.put(:__validated_for_action__, action.name)
+        |> Map.put(:action, action)
+        |> cast_params(action, params, opts)
+        |> run_action_changes(action, opts[:actor])
+        |> add_validations()
+        |> mark_validated(action.name)
+        |> require_arguments(action)
+      else
+        raise_no_action(changeset.resource, action_name, :destroy)
+      end
+    else
+      changeset
+    end
+  end
+
+  defp for_action(changeset, action_name, params, opts) do
+    if changeset.valid? do
+      action = Ash.Resource.Info.action(changeset.resource, action_name, changeset.action_type)
+
+      if action do
+        changeset =
+          changeset
+          |> handle_errors(action.error_handler)
+          |> set_actor(opts)
+          |> set_tenant(opts[:tenant] || changeset.tenant)
+          |> Map.put(:action, action)
+          |> Map.put(:__validated_for_action__, action.name)
+          |> cast_params(action, params || %{}, opts)
+          |> validate_attributes_accepted(action)
+          |> require_values(action.type, false, action.require_attributes)
+          |> run_action_changes(action, opts[:actor])
+          |> set_defaults(changeset.action_type, false)
+          |> add_validations()
+          |> mark_validated(action.name)
+          |> require_arguments(action)
+
+        if Keyword.get(opts, :require?, true) do
+          require_values(changeset, action.type)
+        else
+          changeset
+        end
+      else
+        raise_no_action(changeset.resource, action_name, changeset.action_type)
+      end
+    else
+      changeset
+    end
+  end
+
+  defp require_arguments(changeset, action) do
+    changeset
+    |> set_argument_defaults(action)
+    |> do_require_arguments(action)
+  end
+
+  defp do_require_arguments(changeset, action) do
+    action.arguments
+    |> Enum.filter(&(&1.allow_nil? == false))
+    |> Enum.reduce(changeset, fn argument, changeset ->
+      case fetch_argument(changeset, argument.name) do
+        {:ok, value} when not is_nil(value) ->
+          changeset
+
+        _ ->
+          add_error(
+            changeset,
+            Ash.Error.Changes.Required.exception(
+              resource: changeset.resource,
+              field: argument.name,
+              type: :argument
+            )
+          )
+      end
+    end)
+  end
+
+  defp set_argument_defaults(changeset, action) do
+    Enum.reduce(action.arguments, changeset, fn argument, changeset ->
+      case fetch_argument(changeset, argument.name) do
+        :error ->
+          if is_nil(argument.default) do
+            changeset
+          else
+            %{
+              changeset
+              | arguments: Map.put(changeset.arguments, argument.name, default(:create, argument))
+            }
+          end
+
+        _ ->
+          changeset
+      end
+    end)
+  end
+
+  defp set_actor(changeset, opts) do
+    if Keyword.has_key?(opts, :actor) do
+      put_context(changeset, :private, %{actor: opts[:actor]})
+    else
+      changeset
+    end
+  end
+
+  defp raise_no_action(resource, action, type) do
+    available_actions =
+      resource
+      |> Ash.Resource.Info.actions()
+      |> Enum.filter(&(&1.type == type))
+      |> Enum.map_join("\n", &"    - `#{inspect(&1.name)}`")
+
+    raise ArgumentError,
+      message: """
+      No such #{type} action on resource #{inspect(resource)}: #{String.slice(inspect(action), 0..50)}
+
+      Example Call:
+
+        Ash.Changeset.for_#{type}(changeset_or_record, :action_name, input, options)
+
+      Available #{type} actions:
+
+      #{available_actions}
+      """
+  end
+
+  defp mark_validated(changeset, action_name) do
+    %{changeset | __validated_for_action__: action_name}
+  end
+
+  @doc false
+  def validate_multitenancy(changeset) do
+    if Ash.Resource.Info.multitenancy_strategy(changeset.resource) &&
+         not Ash.Resource.Info.multitenancy_global?(changeset.resource) &&
+         is_nil(changeset.tenant) do
+      add_error(
+        changeset,
+        "#{inspect(changeset.resource)} changesets require a tenant to be specified"
+      )
+    else
+      changeset
+    end
+  end
+
+  defp cast_params(changeset, action, params, opts) do
+    changeset = %{
+      changeset
+      | params: Map.merge(changeset.params || %{}, Enum.into(params || %{}, %{}))
+    }
+
+    Enum.reduce(params, changeset, fn {name, value}, changeset ->
+      cond do
+        has_argument?(action, name) ->
+          set_argument(changeset, name, value)
+
+        attr = Ash.Resource.Info.public_attribute(changeset.resource, name) ->
+          if attr.writable? do
+            change_attribute(changeset, attr.name, value)
+          else
+            changeset
+          end
+
+        rel = Ash.Resource.Info.public_relationship(changeset.resource, name) ->
+          if rel.writable? do
+            behaviour = opts[:relationships][rel.name]
+
+            case behaviour do
+              nil ->
+                changeset
+
+              type when is_atom(type) ->
+                manage_relationship(changeset, rel.name, value, type: type)
+
+              {:manage, manage_opts} ->
+                manage_relationship(changeset, rel.name, value, manage_opts)
+            end
+          else
+            changeset
+          end
+
+        true ->
+          changeset
+      end
+    end)
+  end
+
+  defp has_argument?(action, name) when is_atom(name) do
+    Enum.any?(action.arguments, &(&1.private? == false && &1.name == name))
+  end
+
+  defp has_argument?(action, name) when is_binary(name) do
+    Enum.any?(action.arguments, &(&1.private? == false && to_string(&1.name) == name))
+  end
+
+  defp validate_attributes_accepted(changeset, %{accept: nil}), do: changeset
+
+  defp validate_attributes_accepted(changeset, %{accept: accepted_attributes}) do
+    changeset.attributes
+    |> Enum.reject(fn {key, _value} ->
+      key in accepted_attributes
+    end)
+    |> Enum.reduce(changeset, fn {key, _}, changeset ->
+      add_error(
+        changeset,
+        InvalidAttribute.exception(field: key, message: "cannot be changed")
+      )
+    end)
+  end
+
+  defp run_action_changes(changeset, %{changes: changes}, actor) do
+    Enum.reduce(changes, changeset, fn
+      %{change: {module, opts}}, changeset ->
+        module.change(changeset, opts, %{actor: actor})
+
+      %{validation: _} = validation, changeset ->
+        validate(changeset, validation)
+    end)
+  end
+
+  @doc false
+  def set_defaults(changeset, action_type, lazy? \\ false)
+
+  def set_defaults(changeset, :create, lazy?) do
+    changeset.resource
+    |> Ash.Resource.Info.attributes()
+    |> Enum.filter(&(not is_nil(&1.default)))
+    |> Enum.filter(fn attribute ->
+      lazy? or
+        not (is_function(attribute.default) or match?({_, _, _}, attribute.default))
+    end)
+    |> Enum.reduce(changeset, fn attribute, changeset ->
+      force_change_new_attribute_lazy(changeset, attribute.name, fn ->
+        default(:create, attribute)
+      end)
+    end)
+  end
+
+  def set_defaults(changeset, :update, lazy?) do
+    changeset.resource
+    |> Ash.Resource.Info.attributes()
+    |> Enum.filter(&(not is_nil(&1.update_default)))
+    |> Enum.filter(fn attribute ->
+      lazy? or
+        not (is_function(attribute.update_default) or match?({_, _, _}, attribute.update_default))
+    end)
+    |> Enum.reduce(changeset, fn attribute, changeset ->
+      force_change_new_attribute_lazy(changeset, attribute.name, fn ->
+        default(:update, attribute)
+      end)
+    end)
+  end
+
+  def set_defaults(changeset, _, _) do
+    changeset
+  end
+
+  defp default(:create, %{default: {mod, func, args}}), do: apply(mod, func, args)
+  defp default(:create, %{default: function}) when is_function(function, 0), do: function.()
+  defp default(:create, %{default: value}), do: value
+
+  defp default(:update, %{update_default: {mod, func, args}}), do: apply(mod, func, args)
+
+  defp default(:update, %{update_default: function}) when is_function(function, 0),
+    do: function.()
+
+  defp default(:update, %{update_default: value}), do: value
+
+  defp add_validations(changeset) do
+    changeset.resource
+    # We use the `changeset.action_type` to support soft deletes
+    # Because a delete is an `update` with an action type of `update`
+    |> Ash.Resource.Info.validations(changeset.action_type)
+    |> Enum.reduce(changeset, &validate(&2, &1))
+  end
+
+  defp validate(changeset, validation) do
+    if validation.before_action? do
+      before_action(changeset, fn changeset ->
+        if validation.expensive? and not changeset.valid? do
+          changeset
+        else
+          do_validation(changeset, validation)
+        end
+      end)
+    else
+      if validation.expensive? and not changeset.valid? do
+        changeset
+      else
+        do_validation(changeset, validation)
+      end
+    end
+  end
+
+  defp do_validation(changeset, validation) do
+    case validation.module.validate(changeset, validation.opts) do
+      :ok ->
+        changeset
+
+      {:error, error} when is_binary(error) ->
+        Ash.Changeset.add_error(changeset, validation.message || error)
+
+      {:error, error} when is_exception(error) ->
+        if validation.message do
+          error =
+            case error do
+              %{field: field} when not is_nil(field) ->
+                error
+                |> Map.take([:field, :vars])
+                |> Map.to_list()
+                |> Keyword.put(:message, validation.message)
+                |> InvalidAttribute.exception()
+
+              %{fields: fields} when fields not in [nil, []] ->
+                error
+                |> Map.take([:fields, :vars])
+                |> Map.to_list()
+                |> Keyword.put(:message, validation.message)
+                |> InvalidChanges.exception()
+
+              _ ->
+                validation.message
+            end
+
+          Ash.Changeset.add_error(changeset, error)
+        else
+          Ash.Changeset.add_error(changeset, error)
+        end
+
+      {:error, error} ->
+        error =
+          if Keyword.keyword?(error) do
+            Keyword.put(error, :message, validation.message || error[:message])
+          else
+            validation.message || error
+          end
+
+        Ash.Changeset.add_error(changeset, error)
+    end
+  end
+
+  @doc false
+  def require_values(changeset, action_type, private_and_belongs_to? \\ false, attrs \\ nil)
+
+  def require_values(changeset, :create, private_and_belongs_to?, attrs) do
+    attributes = attrs || attributes_to_require(changeset.resource, private_and_belongs_to?)
+
+    Enum.reduce(attributes, changeset, fn required_attribute, changeset ->
+      if is_atom(required_attribute) do
+        if is_nil(get_attribute(changeset, required_attribute)) do
+          add_error(
+            changeset,
+            Required.exception(
+              resource: changeset.resource,
+              field: required_attribute,
+              type: :attribute
+            )
+          )
+        else
+          changeset
+        end
+      else
+        if changing_attribute?(changeset, required_attribute.name) ||
+             not is_nil(required_attribute.default) do
+          changeset
+        else
+          add_error(
+            changeset,
+            Required.exception(
+              resource: changeset.resource,
+              field: required_attribute.name,
+              type: :attribute
+            )
+          )
+        end
+      end
+    end)
+  end
+
+  def require_values(changeset, :update, private_and_belongs_to?, attrs) do
+    attributes = attrs || attributes_to_require(changeset.resource, private_and_belongs_to?)
+
+    Enum.reduce(attributes, changeset, fn required_attribute, changeset ->
+      if is_atom(required_attribute) do
+        if is_nil(get_attribute(changeset, required_attribute)) do
+          add_error(
+            changeset,
+            Required.exception(
+              resource: changeset.resource,
+              field: required_attribute,
+              type: :attribute
+            )
+          )
+        else
+          changeset
+        end
+      else
+        if changing_attribute?(changeset, required_attribute.name) do
+          if is_nil(get_attribute(changeset, required_attribute.name)) do
+            add_error(
+              changeset,
+              Required.exception(
+                resource: changeset.resource,
+                field: required_attribute.name,
+                type: :attribute
+              )
+            )
+          else
+            changeset
+          end
+        else
+          changeset
+        end
+      end
+    end)
+  end
+
+  def require_values(changeset, _, _, _), do: changeset
+
+  # Attributes that are private and/or are the source field of a belongs_to relationship
+  # are typically not set by input, so they aren't required until the actual action
+  # is run.
+  defp attributes_to_require(resource, true = _private_and_belongs_to?) do
+    resource
+    |> Ash.Resource.Info.attributes()
+    |> Enum.reject(&(&1.allow_nil? || &1.generated?))
+  end
+
+  defp attributes_to_require(resource, false = _private_and_belongs_to?) do
+    belongs_to =
+      resource
+      |> Ash.Resource.Info.relationships()
+      |> Enum.filter(&(&1.type == :belongs_to))
+      |> Enum.map(& &1.source_field)
+
+    resource
+    |> Ash.Resource.Info.attributes()
+    |> Enum.reject(&(&1.allow_nil? || &1.private? || &1.generated? || &1.name in belongs_to))
   end
 
   @doc """
@@ -113,36 +914,127 @@ defmodule Ash.Changeset do
   `{:ok, result}`, the result will be passed through the after
   action hooks.
   """
-  @spec with_hooks(t(), (t() -> {:ok, Ash.record()} | {:error, term})) ::
-          {:ok, term} | {:error, term}
+  @spec with_hooks(
+          t(),
+          (t() ->
+             {:ok, term, %{notifications: list(Ash.Notifier.Notification.t())}}
+             | {:error, term})
+        ) ::
+          {:ok, term, t(), %{notifications: list(Ash.Notifier.Notification.t())}} | {:error, term}
+  def with_hooks(%{valid?: false} = changeset, _func) do
+    {:error, changeset.errors}
+  end
+
   def with_hooks(changeset, func) do
-    changeset =
-      Enum.reduce_while(changeset.before_action, changeset, fn before_action, changeset ->
-        case before_action.(changeset) do
-          %{valid?: true} = changeset -> {:cont, changeset}
-          changeset -> {:halt, changeset}
+    {changeset, %{notifications: before_action_notifications}} =
+      Enum.reduce_while(
+        changeset.before_action,
+        {changeset, %{notifications: []}},
+        fn before_action, {changeset, instructions} ->
+          case before_action.(changeset) do
+            {changeset, %{notifications: notifications}} ->
+              cont =
+                if changeset.valid? do
+                  :cont
+                else
+                  :halt
+                end
+
+              {cont,
+               {changeset,
+                %{
+                  instructions
+                  | notifications: instructions.notifications ++ List.wrap(notifications)
+                }}}
+
+            changeset ->
+              cont =
+                if changeset.valid? do
+                  :cont
+                else
+                  :halt
+                end
+
+              {cont, {changeset, instructions}}
+          end
         end
-      end)
+      )
 
     if changeset.valid? do
       case func.(changeset) do
-        {:ok, result} ->
-          Enum.reduce_while(
-            changeset.after_action,
-            {:ok, result},
-            fn after_action, {:ok, result} ->
-              case after_action.(changeset, result) do
-                {:ok, new_result} -> {:cont, {:ok, new_result}}
-                {:error, error} -> {:halt, {:error, error}}
-              end
-            end
+        {:ok, result, instructions} ->
+          run_after_actions(
+            result,
+            changeset,
+            List.wrap(instructions[:notifications]) ++ before_action_notifications
           )
+
+        {:ok, result} ->
+          run_after_actions(result, changeset, before_action_notifications)
 
         {:error, error} ->
           {:error, error}
       end
     else
       {:error, changeset.errors}
+    end
+  end
+
+  defp run_after_actions(result, changeset, before_action_notifications) do
+    Enum.reduce_while(
+      changeset.after_action,
+      {:ok, result, changeset, %{notifications: before_action_notifications}},
+      fn after_action, {:ok, result, changeset, %{notifications: notifications} = acc} ->
+        case after_action.(changeset, result) do
+          {:ok, new_result, new_notifications} ->
+            all_notifications =
+              Enum.map(notifications ++ new_notifications, fn notification ->
+                %{
+                  notification
+                  | resource: notification.resource || changeset.resource,
+                    action:
+                      notification.action ||
+                        Ash.Resource.Info.action(
+                          changeset.resource,
+                          changeset.action,
+                          changeset.action_type
+                        ),
+                    data: notification.data || new_result,
+                    changeset: notification.changeset || changeset,
+                    actor: notification.actor || changeset.context[:private][:actor]
+                }
+              end)
+
+            {:cont, {:ok, new_result, changeset, %{acc | notifications: all_notifications}}}
+
+          {:ok, new_result} ->
+            {:cont, {:ok, new_result, changeset, acc}}
+
+          {:error, error} ->
+            {:halt, {:error, error}}
+        end
+      end
+    )
+  end
+
+  @doc "Gets the value of an argument provided to the changeset"
+  @spec get_argument(t, atom) :: term
+  def get_argument(changeset, argument) when is_atom(argument) do
+    Map.get(changeset.arguments, argument) || Map.get(changeset.arguments, to_string(argument))
+  end
+
+  @doc "fetches the value of an argument provided to the changeset or `:error`"
+  @spec fetch_argument(t, atom) :: {:ok, term} | :error
+  def fetch_argument(changeset, argument) when is_atom(argument) do
+    case Map.fetch(changeset.arguments, argument) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :error ->
+        case Map.fetch(changeset.arguments, to_string(argument)) do
+          {:ok, value} -> {:ok, value}
+          :error -> :error
+        end
     end
   end
 
@@ -158,10 +1050,28 @@ defmodule Ash.Changeset do
     end
   end
 
+  @doc "Gets the value of an argument provided to the changeset, falling back to `Ash.Changeset.get_attribute/2` if nothing was provided"
+  @spec get_argument_or_attribute(t, atom) :: term
+  def get_argument_or_attribute(changeset, attribute) do
+    case fetch_argument(changeset, attribute) do
+      {:ok, value} -> value
+      :error -> get_attribute(changeset, attribute)
+    end
+  end
+
   @doc "Gets the new value for an attribute, or `:error` if it is not being changed"
   @spec fetch_change(t, atom) :: {:ok, any} | :error
   def fetch_change(changeset, attribute) do
     Map.fetch(changeset.attributes, attribute)
+  end
+
+  @doc "Gets the value of an argument provided to the changeset, falling back to `Ash.Changeset.fetch_change/2` if nothing was provided"
+  @spec fetch_argument_or_change(t, atom) :: {:ok, any} | :error
+  def fetch_argument_or_change(changeset, attribute) do
+    case fetch_argument(changeset, attribute) do
+      {:ok, value} -> {:ok, value}
+      :error -> fetch_change(changeset, attribute)
+    end
   end
 
   @doc "Gets the original value for an attribute"
@@ -170,31 +1080,377 @@ defmodule Ash.Changeset do
     Map.get(changeset.data, attribute)
   end
 
+  @doc """
+  Puts a key/value in the changeset context that can be used later
+
+  Do not use the `private` key in your custom context, as that is reserved for internal use.
+  """
   @spec put_context(t(), atom, term) :: t()
   def put_context(changeset, key, value) do
-    %{changeset | context: Map.put(changeset.context, key, value)}
+    set_context(changeset, %{key => value})
   end
 
-  @spec set_context(t(), map) :: t()
+  @spec set_tenant(t(), String.t()) :: t()
+  def set_tenant(changeset, tenant) do
+    %{changeset | tenant: tenant}
+  end
+
+  @doc """
+  Deep merges the provided map into the changeset context that can be used later
+
+  Do not use the `private` key in your custom context, as that is reserved for internal use.
+  """
+  @spec set_context(t(), map | nil) :: t()
+  def set_context(changeset, nil), do: changeset
+
   def set_context(changeset, map) do
-    %{changeset | context: Map.merge(changeset.context, map)}
+    %{changeset | context: Ash.Helpers.deep_merge_maps(changeset.context, map)}
   end
 
+  @type manage_relationship_type :: :replace | :append | :remove | :direct_control
+
+  @spec manage_relationship_opts(manage_relationship_type()) :: Keyword.t()
+  def manage_relationship_opts(:replace) do
+    [
+      on_lookup: :relate,
+      on_no_match: :error,
+      on_match: :ignore,
+      on_missing: :unrelate
+    ]
+  end
+
+  def manage_relationship_opts(:append) do
+    [
+      on_lookup: :relate,
+      on_no_match: :error,
+      on_match: :ignore,
+      on_missing: :ignore
+    ]
+  end
+
+  def manage_relationship_opts(:remove) do
+    [
+      on_no_match: :error,
+      on_match: :unrelate,
+      on_missing: :ignore
+    ]
+  end
+
+  def manage_relationship_opts(:create) do
+    [
+      on_no_match: :create,
+      on_match: :ignore
+    ]
+  end
+
+  def manage_relationship_opts(:direct_control) do
+    [
+      on_lookup: :ignore,
+      on_no_match: :create,
+      on_match: :update,
+      on_missing: :destroy
+    ]
+  end
+
+  @manage_opts [
+    type: [
+      type: {:one_of, @manage_types},
+      doc: """
+      If the `type` is specified, the default values of each option is modified to match that `type` of operation.
+
+      This allows for specifying certain operations much more succinctly. The defaults that are modified are listed below
+
+      ## `:replace`
+        [
+          on_lookup: :relate,
+          on_no_match: :error,
+          on_match: :ignore,
+          on_missing: :unrelate
+        ]
+
+      ## `:append`
+        [
+          on_lookup: :relate,
+          on_no_match: :error,
+          on_match: :ignore,
+          on_missing: :ignore
+        ]
+
+      ## `:remove`
+        [
+          on_no_match: :error,
+          on_match: :unrelate,
+          on_missing: :ignore
+        ]
+
+      ## `:direct_control`
+        [
+          on_lookup: :ignore,
+          on_no_match: :create,
+          on_match: :update,
+          on_missing: :destroy
+        ]
+
+      ## `:create`
+        [
+          on_no_match: :create,
+          on_match: :ignore
+        ]
+      """
+    ],
+    authorize?: [
+      type: :boolean,
+      default: true,
+      doc:
+        "Authorize reads and changes to the destination records, if the primary change is being authorized as well."
+    ],
+    on_no_match: [
+      type: :any,
+      default: :ignore,
+      doc: """
+      instructions for handling records where no matching record existed in the relationship
+          * `:ignore`(default) - those inputs are ignored
+          * `:match` - For "has_one" and "belongs_to" only, any input is treated as a match for an existing value. For has_many and many_to_many, this is the same as :ignore.
+          * `:create` - the records are created using the destination's primary create action
+          * `{:create, :action_name}` - the records are created using the specified action on the destination resource
+          * `{:create, :action_name, :join_table_action_name, [:list, :of, :join_table, :params]}` - Same as `{:create, :action_name}` but takes
+              the list of params specified out and applies them when creating the join table row, with the provided join_table_action_name.
+          * `:error`  - an eror is returned indicating that a record would have been created
+            *  If `on_lookup` is set, and the data contained a primary key or identity, then the error is a `NotFound` error
+            * Otherwise, an `InvalidRelationship` error is returned
+      """
+    ],
+    on_lookup: [
+      type: :any,
+      default: :ignore,
+      doc: """
+      Before creating a record(because no match was found in the relationship), the record can be looked up and related.
+          * `:ignore`(default) - Does not look for existing entries (matches in the current relationship are still considered updates)
+          * `:relate` - Same as calling `{:relate, primary_action_name}`
+          * `{:relate, :action_name}` - the records are looked up by primary key/the first identity that is found (using the primary read action), and related. The action should be:
+              * many_to_many - a create action on the join resource
+              * has_many - an update action on the destination resource
+              * has_one - an update action on the destination resource
+              * belongs_to - an update action on the source resource
+          * `{:relate, :action_name, :read_action_name}` - Same as the above, but customizes the read action called to search for matches.
+          * `:relate_and_update` - Same as `:relate`, but the remaining parameters from the lookup are passed into the action that is used to change the relationship key
+          * `{:relate_and_update, :action_name}` - Same as the above, but customizes the action used. The action should be:
+              * many_to_many - a create action on the join resource
+              * has_many - an update action on the destination resource
+              * has_one - an update action on the destination resource
+              * belongs_to - an update action on the source resource
+          * `{:relate_and_update, :action_name, :read_action_name}` - Same as the above, but customizes the read action called to search for matches.
+          * `{:relate_and_update, :action_name, :read_action_name, [:list, :of, :join_table, :params]}` - Same as the above, but uses the provided list of parameters when creating
+             the join row (only relevant for many to many relationships). Use `:all` to *only* update the join table row, and pass all parameters to its action
+      """
+    ],
+    on_match: [
+      type: :any,
+      default: :ignore,
+      doc: """
+      instructions for handling records where a matching record existed in the relationship already
+          * `:ignore`(default) - those inputs are ignored
+          * `:update` - the record is updated using the destination's primary update action
+          * `{:update, :action_name}` - the record is updated using the specified action on the destination resource
+          * `{:update, :action_name, :join_table_action_name, [:list, :of, :params]}` - Same as `{:update, :action_name}` but takes
+              the list of params specified out and applies them as an update to the join table row (only valid for many to many).
+          * `:error`  - an eror is returned indicating that a record would have been updated
+          * `:no_match` - ignores the primary key match and follows the on_no_match instructions with these records instead.
+          * `:unrelate` - the related item is not destroyed, but the data is "unrelated", making this behave like `remove_from_relationship/3`. The action should be:
+            * many_to_many - the join resource row is destroyed
+            * has_many - the destination_field (on the related record) is set to `nil`
+            * has_one - the destination_field (on the related record) is set to `nil`
+            * belongs_to - the source_field (on this record) is set to `nil`
+          * `{:unrelate, :action_name}` - the record is unrelated using the provided update action. The action should be:
+            * many_to_many - a destroy action on the join resource
+            * has_many - an update action on the destination resource
+            * has_one - an update action on the destination resource
+            * belongs_to - an update action on the source resource
+      """
+    ],
+    on_missing: [
+      type: :any,
+      default: :ignore,
+      doc: """
+      instructions for handling records that existed in the current relationship but not in the input
+          * `:ignore`(default) - those inputs are ignored
+          * `:destroy` - the record is destroyed using the destination's primary destroy action
+          * `{:destroy, :action_name}` - the record is destroyed using the specified action on the destination resource
+          * `{:destroy, :action_name, :join_resource_action_name, [:join, :keys]}` - the record is destroyed using the specified action on the destination resource,
+            but first the join resource is destroyed with its specified action
+          * `:error`  - an error is returned indicating that a record would have been updated
+          * `:unrelate` - the related item is not destroyed, but the data is "unrelated", making this behave like `remove_from_relationship/3`. The action should be:
+            * many_to_many - the join resource row is destroyed
+            * has_many - the destination_field (on the related record) is set to `nil`
+            * has_one - the destination_field (on the related record) is set to `nil`
+            * belongs_to - the source_field (on this record) is set to `nil`
+          * `{:unrelate, :action_name}` - the record is unrelated using the provided update action. The action should be:
+            * many_to_many - a destroy action on the join resource
+            * has_many - an update action on the destination resource
+            * has_one - an update action on the destination resource
+            * belongs_to - an update action on the source resource
+      """
+    ],
+    relationships: [
+      type: :any,
+      default: [],
+      doc: "A keyword list of instructions for nested relationships."
+    ],
+    meta: [
+      type: :any,
+      doc:
+        "Freeform data that will be retained along with the options, which can be used to track/manage the changes that are added to the `relationships` key."
+    ],
+    ignore?: [
+      type: :any,
+      default: false,
+      doc: """
+      This tells Ash to ignore the provided inputs when actually running the action. This can be useful for
+      building up a set of instructions that you intend to handle manually
+      """
+    ]
+  ]
+
+  @doc false
+  def manage_relationship_schema, do: @manage_opts
+
   @doc """
-  Appends a record of list of records to a relationship. Stacks with previous removals/additions.
+  Manages the related records by creating, updating, or destroying them as necessary.
 
-  Accepts a primary key or a list of primary keys. See the section on "Primary Keys" in the
-  module documentation for more.
+  Keep in mind that the default values for all `on_*` are `:ignore`, meaning nothing will happen
+  unless you provide instructions.
 
-  For many to many relationships, accepts changes for any `join_attributes` configured on
-  the resource. See the section on "Join Attributes" in the module documentation for more.
+  The input provided to `manage_relationship` should be a map, in the case of to_one relationships, or a list of maps
+  in the case of to_many relationships. The following steps are followed for each input provided:
 
-  Cannot be used with `belongs_to` or `has_one` relationships.
-  See `replace_relationship/3` for manipulating `belongs_to` and `has_one` relationships.
+  - The input is checked against the currently related records to find any matches. The primary key and unique identities are used to find matches.
+  - For any input that had a match in the current relationship, the `:on_match` behavior is triggered
+  - For any input that does not have a match:
+    - if there is `on_lookup` behavior:
+      - we try to find the record in the data layer.
+      - if the record is found, the on_lookup behavior is triggered
+      - if the record is not found, the `on_no_match` behavior is triggered
+    - if there is no `on_lookup` behavior:
+      - the `on_no_match` behavior is triggered
+  - finally, for any records present in the *current relationship* that had no match *in the input*, the `on_missing` behavior is triggered
+
+  ## Options
+
+  #{Ash.OptionsHelpers.docs(@manage_opts)}
+
+  Each call to this function adds new records that will be handled according to their options. For example,
+  if you tracked "tags to add" and "tags to remove" in separate fields, you could input them like so:
+
+  ```elixir
+  changeset
+  |> Ash.Changeset.manage_relationship(
+    :tags,
+    [%{name: "backend"}],
+    on_lookup: :relate, #relate that tag if it exists in the database
+    on_no_match: :error # error if a tag with that name doesn't exist
+  )
+  |> Ash.Changeset.manage_relationship(
+    :tags,
+    [%{name: "frontend"}],
+    on_no_match: :error, # error if a tag with that name doesn't exist in the relationship
+    on_match: :unrelate # if a tag with that name is related, unrelate it
+  )
+  ```
+
+  When calling this multiple times with the `on_missing` option set, the list of records that are considered missing are checked
+  after each set of inputs is processed. For example, if you manage the relationship once with `on_missing: :unrelate`, the records
+  missing from your input will be removed, and *then* your next call to `manage_relationship` will be resolved (with those records unrelated).
+  For this reason, it is suggested that you don't call this function multiple times with an `on_missing` instruction, as you may be
+  surprised by the result.
+
+  If you want the input to update existing entities, you need to ensure that the primary key (or unique identity) is provided as
+  part of the input. See the example below:
+
+      changeset
+      |> Ash.Changeset.manage_relationship(
+        :comments,
+        [%{rating: 10, contents: "foo"}],
+        on_no_match: {:create, :create_action},
+        on_missing: :ignore
+      )
+      |> Ash.Changeset.manage_relationship(
+        :comments,
+        [%{id: 10, rating: 10, contents: "foo"}],
+        on_match: {:update, :update_action},
+        on_no_match: {:create, :create_action})
+
+  This is a simple way to manage a relationship. If you need custom behavior, you can customize the action that is
+  called, which allows you to add arguments/changes. However, at some point you may want to forego this function
+  and make the changes yourself. For example:
+
+      input = [%{id: 10, rating: 10, contents: "foo"}]
+
+      changeset
+      |> Ash.Changeset.after_action(fn _changeset, result ->
+        # An example of updating comments based on a result of other changes
+        for comment <- input do
+          comment = MyApi.get(Comment, comment.id)
+
+          comment
+          |> Map.update(:rating, 0, &(&1 * result.rating_weight))
+          |> MyApi.update!()
+        end
+
+        {:ok, result}
+      end)
+
+  ## Using records as input
+
+  Records can be supplied as the input values. If you do:
+
+  * if it would be looked up due to `on_lookup`, the record is used as-is
+  * if it would be created due to `on_no_match`, the record is used as-is
+  * Instead of specifying `join_keys`, those keys must go in `__metadata__.join_keys`. If `join_keys` is specified in the options, it is ignored.
+
+  For example:
+
+  ```elixir
+  post1 =
+    changeset
+    |> Api.create!()
+    |> Ash.Resource.Info.put_metadata(:join_keys, %{type: "a"})
+
+  post1 =
+    changeset2
+    |> Api.create!()
+    |> Ash.Resource.Info.put_metadata(:join_keys, %{type: "b"})
+
+  author = Api.create!(author_changeset)
+
+  Ash.Changeset.manage_relationship(
+    author,
+    :posts,
+    [post1, post2],
+    on_lookup: :relate
+  )
+  ```
   """
-  @spec append_to_relationship(t, atom, Ash.primary_key() | [Ash.primary_key()]) :: t()
-  def append_to_relationship(changeset, relationship, record_or_records) do
-    case Ash.Resource.relationship(changeset.resource, relationship) do
+  def manage_relationship(changeset, relationship, input, opts \\ [])
+
+  def manage_relationship(changeset, relationship, "", opts) do
+    manage_relationship(changeset, relationship, nil, opts)
+  end
+
+  def manage_relationship(changeset, relationship, input, opts) do
+    manage_opts =
+      if opts[:type] do
+        defaults = manage_relationship_opts(opts[:type])
+
+        Enum.reduce(defaults, @manage_opts, fn {key, value}, manage_opts ->
+          Ash.OptionsHelpers.set_default!(manage_opts, key, value)
+        end)
+      else
+        @manage_opts
+      end
+
+    opts = Ash.OptionsHelpers.validate!(opts, manage_opts)
+
+    case Ash.Resource.Info.relationship(changeset.resource, relationship) do
       nil ->
         error =
           NoSuchRelationship.exception(
@@ -204,11 +1460,11 @@ defmodule Ash.Changeset do
 
         add_error(changeset, error)
 
-      %{cardinality: :one, type: type} = relationship ->
+      %{cardinality: :one, type: type} = relationship when is_list(input) and length(input) > 1 ->
         error =
           InvalidRelationship.exception(
             relationship: relationship.name,
-            message: "Cannot append to a #{type} relationship"
+            message: "Cannot manage to a #{type} relationship with a list of records"
           )
 
         add_error(changeset, error)
@@ -222,186 +1478,207 @@ defmodule Ash.Changeset do
 
         add_error(changeset, error)
 
-      %{type: :many_to_many} = relationship ->
-        case primary_keys_with_changes(relationship, List.wrap(record_or_records)) do
-          {:ok, primary_keys} ->
-            relationships =
-              changeset.relationships
-              |> Map.put_new(relationship.name, %{})
-              |> add_to_relationship_key_and_reconcile(relationship, :add, primary_keys)
-
-            %{changeset | relationships: relationships}
-
-          {:error, error} ->
-            add_error(changeset, error)
-        end
-
       relationship ->
-        case primary_key(relationship, List.wrap(record_or_records)) do
-          {:ok, primary_keys} ->
+        if relationship.cardinality == :many && is_map(input) && !is_struct(input) do
+          case map_input_to_list(input) do
+            {:ok, input} ->
+              manage_relationship(changeset, relationship.name, input, opts)
+
+            :error ->
+              manage_relationship(changeset, relationship.name, List.wrap(input), opts)
+          end
+        else
+          input =
+            changeset.resource
+            |> Ash.Resource.Info.related(relationship.name)
+            |> Ash.Resource.Info.primary_key()
+            |> case do
+              [key] ->
+                input
+                |> List.wrap()
+                |> Enum.map(fn input ->
+                  if is_map(input) || is_list(input) do
+                    input
+                  else
+                    %{key => input}
+                  end
+                end)
+
+              _ ->
+                input
+            end
+
+          if Enum.any?(
+               List.wrap(input),
+               &(is_struct(&1) && &1.__struct__ != relationship.destination)
+             ) do
+            add_error(
+              changeset,
+              InvalidRelationship.exception(
+                relationship: relationship.name,
+                message: "Cannot provide structs that don't match the destination"
+              )
+            )
+          else
             relationships =
               changeset.relationships
-              |> Map.put_new(relationship.name, %{})
-              |> add_to_relationship_key_and_reconcile(relationship, :add, primary_keys)
+              |> Map.put_new(relationship.name, [])
+              |> Map.update!(relationship.name, &(&1 ++ [{input, opts}]))
 
             %{changeset | relationships: relationships}
-
-          {:error, error} ->
-            add_error(changeset, error)
+          end
         end
     end
   end
 
-  @doc """
-  Removes a record of list of records to a relationship. Stacks with previous removals/additions.
-
-  Accepts a primary key or a list of primary keys. See the section on "Primary Keys" in the
-  module documentation for more.
-
-  Cannot be used with `belongs_to` or `has_one` relationships.
-  See `replace_relationship/3` for manipulating those relationships.
-  """
-  @spec remove_from_relationship(t, atom, Ash.primary_key() | [Ash.primary_key()]) :: t()
-  def remove_from_relationship(changeset, relationship, record_or_records) do
-    case Ash.Resource.relationship(changeset.resource, relationship) do
-      nil ->
-        error =
-          NoSuchRelationship.exception(
-            resource: changeset.resource,
-            name: relationship
-          )
-
-        add_error(changeset, error)
-
-      %{cardinality: :one, type: type} = relationship ->
-        error =
-          InvalidRelationship.exception(
-            relationship: relationship.name,
-            message: "Cannot remove from a #{type} relationship"
-          )
-
-        add_error(changeset, error)
-
-      %{writable?: false} = relationship ->
-        error =
-          InvalidRelationship.exception(
-            relationship: relationship.name,
-            message: "Relationship is not editable"
-          )
-
-        add_error(changeset, error)
-
-      relationship ->
-        case primary_key(relationship, List.wrap(record_or_records)) do
-          {:ok, primary_keys} ->
-            relationships =
-              changeset.relationships
-              |> Map.put_new(relationship.name, %{})
-              |> add_to_relationship_key_and_reconcile(relationship, :remove, primary_keys)
-
-            %{changeset | relationships: relationships}
-
-          {:error, error} ->
-            add_error(changeset, error)
-            nil
-        end
-    end
+  defp map_input_to_list(input) when input == %{} do
+    :error
   end
 
-  defp add_to_relationship_key_and_reconcile(relationships, relationship, key, to_add) do
-    Map.update!(relationships, relationship.name, fn relationship_changes ->
-      relationship_changes
-      |> Map.put_new(key, [])
-      |> Map.update!(key, &Kernel.++(to_add, &1))
-      |> reconcile_relationship_changes()
+  defp map_input_to_list(input) do
+    input
+    |> Enum.reduce_while({:ok, []}, fn
+      {key, value}, {:ok, acc} when is_integer(key) ->
+        {:cont, {:ok, [{key, value} | acc]}}
+
+      {key, value}, {:ok, acc} when is_binary(key) ->
+        case Integer.parse(key) do
+          {int, ""} ->
+            {:cont, {:ok, [{int, value} | acc]}}
+
+          _ ->
+            {:halt, :error}
+        end
+
+      _, _ ->
+        {:halt, :error}
     end)
+    |> case do
+      {:ok, value} ->
+        {:ok,
+         value
+         |> Enum.sort_by(&elem(&1, 0))
+         |> Enum.map(&elem(&1, 1))}
+
+      :error ->
+        :error
+    end
   end
 
   @doc """
-  Replaces the value of a relationship. Any previous additions/removals are cleared.
+  Appends a record or a list of records to a relationship.
 
-  Accepts a primary key or a list of primary keys. See the section on "Primary Keys" in the
-  module documentation for more.
+  Alias for:
+  ```elixir
+  manage_relationship(changeset, relationship, input,
+    on_lookup: :relate, # If a record is not in the relationship, and can be found, relate it
+    on_no_match: :error, # If a record is not found in the relationship or the database, we error
+    on_match: :ignore, # If a record is found in the relationship we don't change it
+    on_missing: :ignore, # If a record is not found in the input, we ignore it
+  )
+  ```
 
-  For many to many relationships, accepts changes for any `join_attributes` configured on
-  the resource. See the section on "Join Attributes" in the module documentation for more.
+  Provide `opts` to customize/override the behavior.
+  """
+  @spec append_to_relationship(
+          t,
+          atom,
+          Ash.Resource.record() | map | term | [Ash.Resource.record() | map | term],
+          Keyword.t()
+        ) ::
+          t()
+  def append_to_relationship(changeset, relationship, record_or_records, opts \\ []) do
+    manage_relationship(
+      changeset,
+      relationship,
+      record_or_records,
+      Keyword.merge(
+        [
+          on_lookup: :relate,
+          on_no_match: :error,
+          on_match: :ignore,
+          on_missing: :ignore,
+          authorize?: false
+        ],
+        opts
+      )
+    )
+  end
 
-  For a `has_many` or `many_to_many` relationship, this means removing any currently related
-  records that are not present in the replacement list, and creating any that do not exist
-  in the data layer.
+  @doc """
+  Removes a record or a list of records to a relationship.
 
-  For a `belongs_to` or `has_one`, replace with a `nil` value to unset a relationship.
+  Alias for:
+  ```elixir
+    manage_relationship(changeset, relationship, record_or_records,
+      on_no_match: :error, # If a record is not found in the relationship, we error
+      on_match: :unrelate, # If a record is found in the relationship we unrelate it
+      on_missing: :ignore, # If a record is not found in the relationship
+      authorize?: false
+    )
+  ```
+  """
+  @spec remove_from_relationship(
+          t,
+          atom,
+          Ash.Resource.record() | map | term | [Ash.Resource.record() | map | term],
+          Keyword.t()
+        ) ::
+          t()
+  def remove_from_relationship(changeset, relationship, record_or_records, opts \\ []) do
+    manage_relationship(
+      changeset,
+      relationship,
+      record_or_records,
+      Keyword.merge(
+        [
+          on_no_match: :error,
+          on_match: :unrelate,
+          on_missing: :ignore,
+          authorize?: false
+        ],
+        opts
+      )
+    )
+  end
+
+  @doc """
+  Alias for:
+  ```elixir
+  manage_relationship(
+    changeset,
+    relationship,
+    record_or_records,
+    on_lookup: :relate, # If a record is not found in the relationship, but is found in the database, relate it and apply the input as an update
+    on_no_match: :error, # If a record is not found in the relationship or the database, we error
+    on_match: :ignore, # If a record is found in the relationship we make no changes to it
+    on_missing: :unrelate, # If a record is not found in the relationship, we unrelate it
+    authorize?: false
+  )
+  ```
   """
   @spec replace_relationship(
           t(),
           atom(),
-          Ash.primary_key() | [Ash.primary_key()] | nil
+          Ash.Resource.record() | map | term | [Ash.Resource.record() | map | term] | nil,
+          Keyword.t()
         ) :: t()
-  def replace_relationship(changeset, relationship, record_or_records) do
-    case Ash.Resource.relationship(changeset.resource, relationship) do
-      nil ->
-        error =
-          NoSuchRelationship.exception(
-            resource: changeset.resource,
-            name: relationship
-          )
-
-        add_error(changeset, error)
-
-      %{writable?: false} = relationship ->
-        error =
-          InvalidRelationship.exception(
-            relationship: relationship.name,
-            message: "Relationship is not editable"
-          )
-
-        add_error(changeset, error)
-
-      %{cardinality: :one, type: type}
-      when is_list(record_or_records) and length(record_or_records) > 1 ->
-        error =
-          InvalidRelationship.exception(
-            relationship: relationship.name,
-            message: "Cannot replace a #{type} relationship with multiple records"
-          )
-
-        add_error(changeset, error)
-
-      %{type: :many_to_many} = relationship ->
-        case primary_keys_with_changes(relationship, List.wrap(record_or_records)) do
-          {:ok, primary_key} ->
-            relationships =
-              Map.put(changeset.relationships, relationship.name, %{replace: primary_key})
-
-            %{changeset | relationships: relationships}
-
-          {:error, error} ->
-            add_error(changeset, error)
-        end
-
-      relationship ->
-        record =
-          if relationship.cardinality == :one do
-            if is_list(record_or_records) do
-              List.first(record_or_records)
-            else
-              record_or_records
-            end
-          else
-            List.wrap(record_or_records)
-          end
-
-        case primary_key(relationship, record) do
-          {:ok, primary_key} ->
-            relationships =
-              Map.put(changeset.relationships, relationship.name, %{replace: primary_key})
-
-            %{changeset | relationships: relationships}
-
-          {:error, error} ->
-            add_error(changeset, error)
-        end
-    end
+  def replace_relationship(changeset, relationship, record_or_records, opts \\ []) do
+    manage_relationship(
+      changeset,
+      relationship,
+      record_or_records,
+      Keyword.merge(
+        [
+          on_lookup: :relate,
+          on_no_match: :error,
+          on_match: :ignore,
+          on_missing: :unrelate,
+          authorize?: false
+        ],
+        opts
+      )
+    )
   end
 
   @doc "Returns true if an attribute exists in the changes"
@@ -441,6 +1718,86 @@ defmodule Ash.Changeset do
     end
   end
 
+  @doc """
+  Add an argument to the changeset, which will be provided to the action
+  """
+  def set_argument(changeset, argument, value) do
+    if changeset.action do
+      argument =
+        Enum.find(
+          changeset.action.arguments,
+          &(&1.name == argument || to_string(&1.name) == argument)
+        )
+
+      if argument do
+        with {:ok, casted} <- cast_input(argument.type, value, argument.constraints, changeset),
+             {:constrained, {:ok, casted}, argument} when not is_nil(casted) <-
+               {:constrained,
+                Ash.Type.apply_constraints(argument.type, casted, argument.constraints),
+                argument} do
+          %{changeset | arguments: Map.put(changeset.arguments, argument.name, casted)}
+        else
+          {:constrained, {:ok, nil}, _argument} ->
+            %{changeset | arguments: Map.put(changeset.arguments, argument.name, nil)}
+
+          {:constrained, {:error, error}, argument} ->
+            changeset = %{
+              changeset
+              | arguments: Map.put(changeset.arguments, argument.name, value)
+            }
+
+            add_invalid_errors(:argument, changeset, argument, error)
+
+          {:error, error} ->
+            changeset = %{
+              changeset
+              | arguments: Map.put(changeset.arguments, argument.name, value)
+            }
+
+            add_invalid_errors(:argument, changeset, argument, error)
+        end
+      else
+        %{changeset | arguments: Map.put(changeset.arguments, argument, value)}
+      end
+    else
+      %{changeset | arguments: Map.put(changeset.arguments, argument, value)}
+    end
+  end
+
+  @doc """
+  Remove an argument from the changeset
+  """
+  def delete_argument(changeset, argument_or_arguments) do
+    argument_or_arguments
+    |> List.wrap()
+    |> Enum.reduce(changeset, fn argument, changeset ->
+      %{changeset | arguments: Map.delete(changeset.arguments, argument)}
+    end)
+  end
+
+  @doc """
+  Merge a map of arguments to the arguments list
+  """
+  def set_arguments(changeset, map) do
+    Enum.reduce(map, changeset, fn {key, value}, changeset ->
+      set_argument(changeset, key, value)
+    end)
+  end
+
+  @doc """
+  Force change an attribute if is not currently being changed, by calling the provided function
+
+  See `change_new_attribute_lazy/3` for more.
+  """
+  @spec force_change_new_attribute_lazy(t(), atom, (() -> any)) :: t()
+  def force_change_new_attribute_lazy(changeset, attribute, func) do
+    if changing_attribute?(changeset, attribute) do
+      changeset
+    else
+      force_change_attribute(changeset, attribute, func.())
+    end
+  end
+
   @doc "Calls `change_attribute/3` for each key/value pair provided"
   @spec change_attributes(t(), map | Keyword.t()) :: t()
   def change_attributes(changeset, changes) do
@@ -451,7 +1808,7 @@ defmodule Ash.Changeset do
 
   @doc "Adds a change to the changeset, unless the value matches the existing value"
   def change_attribute(changeset, attribute, value) do
-    case Ash.Resource.attribute(changeset.resource, attribute) do
+    case Ash.Resource.Info.attribute(changeset.resource, attribute) do
       nil ->
         error =
           NoSuchAttribute.exception(
@@ -462,35 +1819,116 @@ defmodule Ash.Changeset do
         add_error(changeset, error)
 
       %{writable?: false} = attribute ->
-        add_attribute_invalid_error(changeset, attribute, "Attribute is not writable")
+        changeset = %{
+          changeset
+          | attributes: Map.put(changeset.attributes, attribute.name, value)
+        }
+
+        add_invalid_errors(:attribute, changeset, attribute, "Attribute is not writable")
 
       attribute ->
-        with {:ok, casted} <- Ash.Type.cast_input(attribute.type, value),
-             :ok <- validate_allow_nil(attribute, casted),
-             :ok <- Ash.Type.apply_constraints(attribute.type, casted, attribute.constraints) do
+        with value <- handle_indexed_maps(attribute.type, value),
+             {:ok, prepared} <-
+               prepare_change(changeset, attribute, value, attribute.constraints),
+             {:ok, casted} <-
+               cast_input(attribute.type, prepared, attribute.constraints, changeset, true),
+             {:ok, casted} <-
+               handle_change(changeset, attribute, casted, attribute.constraints),
+             :ok <-
+               validate_allow_nil(attribute, casted),
+             {:ok, casted} <-
+               Ash.Type.apply_constraints(attribute.type, casted, attribute.constraints) do
           data_value = Map.get(changeset.data, attribute.name)
 
           cond do
             is_nil(data_value) and is_nil(casted) ->
-              changeset
+              %{changeset | attributes: Map.delete(changeset.attributes, attribute.name)}
 
             Ash.Type.equal?(attribute.type, casted, data_value) ->
-              changeset
+              %{changeset | attributes: Map.delete(changeset.attributes, attribute.name)}
 
             true ->
               %{changeset | attributes: Map.put(changeset.attributes, attribute.name, casted)}
           end
         else
+          {{:error, error_or_errors}, last_val} ->
+            changeset = %{
+              changeset
+              | attributes: Map.put(changeset.attributes, attribute.name, last_val)
+            }
+
+            add_invalid_errors(:attribute, changeset, attribute, error_or_errors)
+
           :error ->
-            add_attribute_invalid_error(changeset, attribute)
+            changeset = %{
+              changeset
+              | attributes: Map.put(changeset.attributes, attribute.name, value)
+            }
+
+            add_invalid_errors(:attribute, changeset, attribute)
 
           {:error, error_or_errors} ->
-            error_or_errors
-            |> List.wrap()
-            |> Enum.reduce(changeset, &add_attribute_invalid_error(&2, attribute, &1))
+            changeset = %{
+              changeset
+              | attributes: Map.put(changeset.attributes, attribute.name, value)
+            }
+
+            add_invalid_errors(:attribute, changeset, attribute, error_or_errors)
         end
     end
   end
+
+  @doc false
+  def cast_input(type, term, constraints, changeset, return_value? \\ false)
+
+  def cast_input(type, value, constraints, changeset, return_value?) do
+    value = handle_indexed_maps(type, value)
+    constraints = Ash.Type.constraints(changeset, type, constraints)
+
+    case Ash.Type.cast_input(type, value, constraints) do
+      {:ok, value} ->
+        {:ok, value}
+
+      {:error, error} ->
+        if return_value? do
+          {{:error, error}, value}
+        else
+          {:error, error}
+        end
+    end
+  end
+
+  defp handle_indexed_maps({:array, type}, term) when is_map(term) and term != %{} do
+    term
+    |> Enum.reduce_while({:ok, []}, fn
+      {key, value}, {:ok, acc} when is_integer(key) ->
+        {:cont, {:ok, [{key, value} | acc]}}
+
+      {key, value}, {:ok, acc} when is_binary(key) ->
+        case Integer.parse(key) do
+          {int, ""} ->
+            {:cont, {:ok, [{int, value} | acc]}}
+
+          _ ->
+            {:halt, :error}
+        end
+
+      _, _ ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, value} ->
+        value
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(&elem(&1, 1))
+        |> Enum.map(&handle_indexed_maps(type, &1))
+
+      :error ->
+        term
+    end
+  end
+
+  defp handle_indexed_maps(_, value), do: value
 
   @doc "Calls `force_change_attribute/3` for each key/value pair provided"
   @spec force_change_attributes(t(), map) :: t()
@@ -503,7 +1941,7 @@ defmodule Ash.Changeset do
   @doc "Changes an attribute even if it isn't writable"
   @spec force_change_attribute(t(), atom, any) :: t()
   def force_change_attribute(changeset, attribute, value) do
-    case Ash.Resource.attribute(changeset.resource, attribute) do
+    case Ash.Resource.Info.attribute(changeset.resource, attribute) do
       nil ->
         error =
           NoSuchAttribute.exception(
@@ -513,9 +1951,18 @@ defmodule Ash.Changeset do
 
         add_error(changeset, error)
 
+      attribute when is_nil(value) ->
+        %{changeset | attributes: Map.put(changeset.attributes, attribute.name, nil)}
+
       attribute ->
-        with {:ok, casted} <- Ash.Type.cast_input(attribute.type, value),
-             :ok <- Ash.Type.apply_constraints(attribute.type, casted, attribute.constraints) do
+        with value <- handle_indexed_maps(attribute.type, value),
+             {:ok, prepared} <-
+               prepare_change(changeset, attribute, value, attribute.constraints),
+             {:ok, casted} <-
+               cast_input(attribute.type, prepared, attribute.constraints, changeset),
+             {:ok, casted} <- handle_change(changeset, attribute, casted, attribute.constraints),
+             {:ok, casted} <-
+               Ash.Type.apply_constraints(attribute.type, casted, attribute.constraints) do
           data_value = Map.get(changeset.data, attribute.name)
 
           cond do
@@ -530,217 +1977,310 @@ defmodule Ash.Changeset do
           end
         else
           :error ->
-            add_attribute_invalid_error(changeset, attribute)
+            changeset = %{
+              changeset
+              | attributes: Map.put(changeset.attributes, attribute.name, value)
+            }
+
+            add_invalid_errors(:attribute, changeset, attribute)
 
           {:error, error_or_errors} ->
-            error_or_errors
-            |> List.wrap()
-            |> Enum.reduce(changeset, &add_attribute_invalid_error(&2, attribute, &1))
+            changeset = %{
+              changeset
+              | attributes: Map.put(changeset.attributes, attribute.name, value)
+            }
+
+            add_invalid_errors(:attribute, changeset, attribute, error_or_errors)
         end
     end
   end
 
   @doc "Adds a before_action hook to the changeset."
-  @spec before_action(t(), (t() -> t())) :: t()
+  @spec before_action(
+          t(),
+          (t() -> t() | {t(), %{notificactions: list(Ash.Notifier.Notification.t())}})
+        ) ::
+          t()
   def before_action(changeset, func) do
     %{changeset | before_action: [func | changeset.before_action]}
   end
 
   @doc "Adds an after_action hook to the changeset."
-  @spec after_action(t(), (t(), Ash.record() -> {:ok, Ash.record()} | {:error, term})) :: t()
+  @spec after_action(
+          t(),
+          (t(), Ash.Resource.record() ->
+             {:ok, Ash.Resource.record()}
+             | {:ok, Ash.Resource.record(), list(Ash.Notifier.Notification.t())}
+             | {:error, term})
+        ) :: t()
   def after_action(changeset, func) do
-    %{changeset | after_action: [func | changeset.after_action]}
+    %{changeset | after_action: changeset.after_action ++ [func]}
   end
 
-  @doc "Returns the original data with attribute changes merged."
-  @spec apply_attributes(t()) :: Ash.record()
-  def apply_attributes(changeset) do
-    Enum.reduce(changeset.attributes, changeset.data, fn {attribute, value}, data ->
-      Map.put(data, attribute, value)
-    end)
+  @doc """
+  Returns the original data with attribute changes merged, if the changeset is valid.
+
+  Options:
+
+  * force? - applies current attributes even if the changeset is not valid
+  """
+  @spec apply_attributes(t(), opts :: Keyword.t()) :: {:ok, Ash.Resource.record()} | {:error, t()}
+  def apply_attributes(changeset, opts \\ [])
+
+  def apply_attributes(%{valid?: true} = changeset, _opts) do
+    {:ok,
+     Enum.reduce(changeset.attributes, changeset.data, fn {attribute, value}, data ->
+       Map.put(data, attribute, value)
+     end)}
+  end
+
+  def apply_attributes(changeset, opts) do
+    if opts[:force?] do
+      apply_attributes(%{changeset | valid?: true}, opts)
+    else
+      {:error, changeset}
+    end
+  end
+
+  @doc "Clears an attribute or relationship change off of the changeset"
+  def clear_change(changeset, field) do
+    cond do
+      attr = Ash.Resource.Info.attribute(changeset.resource, field) ->
+        %{changeset | attributes: Map.delete(changeset.attributes, attr.name)}
+
+      rel = Ash.Resource.Info.relationship(changeset.resource, field) ->
+        %{changeset | relationships: Map.delete(changeset.relationships, rel.name)}
+
+      true ->
+        changeset
+    end
+  end
+
+  @doc """
+  Sets a custom error handler on the changeset.
+
+  The error handler should be a two argument function or an mfa, in which case the first two arguments will be set
+  to the changeset and the error, w/ the supplied arguments following those.
+
+  Any errors generated are passed to `handle_errors`, which can return any of the following:
+
+  * `:ignore` - the error is discarded, and the changeset is not marked as invalid
+  * `changeset` - a new (or the same) changeset. The error is not added (you'll want to add an error yourself), but the changeset *is* marked as invalid.
+  * `{changeset, error}` - a new (or the same) error and changeset. The error is added to the changeset, and the changeset is marked as invalid.
+  * `anything_else` - is treated as a new, transformed version of the error. The result is added as an error to the changeset, and the changeset is marked as invalid.
+  """
+  @spec handle_errors(
+          t(),
+          (t(), error :: term -> :ignore | t() | (error :: term) | {error :: term, t()})
+          | {module, atom, [term]}
+        ) :: t()
+  def handle_errors(changeset, {m, f, a}) do
+    %{changeset | handle_errors: &apply(m, f, [&1, &2 | a])}
+  end
+
+  def handle_errors(changeset, func) do
+    %{changeset | handle_errors: func}
   end
 
   @doc "Adds an error to the changesets errors list, and marks the change as `valid?: false`"
-  @spec add_error(t(), Ash.error()) :: t()
-  def add_error(changeset, error) do
-    %{changeset | errors: [error | changeset.errors], valid?: false}
-  end
+  @spec add_error(t(), term | String.t() | list(term | String.t())) :: t()
+  def add_error(changeset, errors, path \\ [])
 
-  defp reconcile_relationship_changes(%{replace: _, add: add} = changes) do
-    changes
-    |> Map.delete(:add)
-    |> Map.update!(:replace, fn replace ->
-      replace ++ add
-    end)
-    |> reconcile_relationship_changes()
-  end
-
-  defp reconcile_relationship_changes(%{replace: _, remove: remove} = changes) do
-    changes
-    |> Map.delete(:remove)
-    |> Map.update!(:replace, fn replace ->
-      Enum.reject(replace, &(&1 in remove))
-    end)
-    |> reconcile_relationship_changes()
-  end
-
-  defp reconcile_relationship_changes(changes) do
-    changes
-    |> update_if_present(:replace, &uniq_if_list/1)
-    |> update_if_present(:remove, &uniq_if_list/1)
-    |> update_if_present(:add, &uniq_if_list/1)
-  end
-
-  defp uniq_if_list(list) when is_list(list), do: Enum.uniq(list)
-  defp uniq_if_list(other), do: other
-
-  defp update_if_present(map, key, func) do
-    if Map.has_key?(map, key) do
-      Map.update!(map, key, func)
+  def add_error(changeset, errors, path) when is_list(errors) do
+    if Keyword.keyword?(errors) do
+      errors
+      |> to_change_error()
+      |> handle_error(changeset)
     else
-      map
+      Enum.reduce(errors, changeset, &add_error(&2, &1, path))
     end
   end
 
-  defp through_changeset(relationship, changes) do
-    new(relationship.through, changes)
+  def add_error(changeset, error, path) when is_binary(error) do
+    add_error(
+      changeset,
+      InvalidChanges.exception(message: error),
+      path
+    )
   end
 
-  defp primary_keys_with_changes(_, []), do: {:ok, []}
-
-  defp primary_keys_with_changes(relationship, records) do
-    Enum.reduce_while(records, {:ok, []}, fn
-      {record, changes}, {:ok, acc} ->
-        with {:ok, primary_key} <- primary_key(relationship, record),
-             %{valid?: true} = changeset <- through_changeset(relationship, changes) do
-          {:cont, {:ok, [{primary_key, changeset} | acc]}}
-        else
-          %{valid?: false, errors: errors} -> {:halt, {:error, errors}}
-          {:error, error} -> {:halt, {:error, error}}
-        end
-
-      record, {:ok, acc} ->
-        case primary_key(relationship, record) do
-          {:ok, primary_key} -> {:cont, {:ok, [primary_key | acc]}}
-          {:error, error} -> {:halt, {:error, error}}
-        end
-    end)
+  def add_error(changeset, error, path) do
+    error
+    |> set_path(path)
+    |> handle_error(changeset)
   end
 
-  defp primary_key(_, nil), do: {:ok, nil}
-
-  defp primary_key(relationship, records) when is_list(records) do
-    case Ash.Resource.primary_key(relationship.destination) do
-      [_field] ->
-        multiple_primary_keys(relationship, records)
-
-      _ ->
-        case single_primary_key(relationship, records) do
-          {:ok, keys} ->
-            {:ok, keys}
-
-          {:error, _} ->
-            do_primary_key(relationship, records)
-        end
-    end
+  @doc false
+  def set_path(errors, path) when is_list(errors) do
+    Enum.map(errors, &set_path(&1, path))
   end
 
-  defp primary_key(relationship, record) do
-    do_primary_key(relationship, record)
-  end
-
-  defp do_primary_key(relationship, record) when is_map(record) do
-    primary_key = Ash.Resource.primary_key(relationship.destination)
-
-    is_pkey_map? =
-      Enum.all?(primary_key, fn key ->
-        Map.has_key?(record, key) || Map.has_key?(record, to_string(key))
-      end)
-
-    if is_pkey_map? do
-      pkey =
-        Enum.reduce(primary_key, %{}, fn key, acc ->
-          case Map.fetch(record, key) do
-            {:ok, value} -> Map.put(acc, key, value)
-            :error -> Map.put(acc, key, Map.get(record, to_string(key)))
-          end
-        end)
-
-      {:ok, pkey}
-    else
-      error =
-        InvalidRelationship.exception(
-          relationship: relationship.name,
-          message: "Invalid identifier #{inspect(record)}"
-        )
-
-      {:error, error}
-    end
-  end
-
-  defp do_primary_key(relationship, record) do
-    single_primary_key(relationship, record)
-  end
-
-  defp multiple_primary_keys(relationship, values) do
-    Enum.reduce_while(values, {:ok, []}, fn record, {:ok, primary_keys} ->
-      case do_primary_key(relationship, record) do
-        {:ok, pkey} -> {:cont, {:ok, [pkey | primary_keys]}}
-        {:error, error} -> {:halt, {:error, error}}
+  def set_path(error, path) do
+    error =
+      if Map.has_key?(error, :path) && is_list(error.path) do
+        %{error | path: path ++ error.path}
+      else
+        error
       end
-    end)
-  end
 
-  defp single_primary_key(relationship, value) do
-    with [field] <- Ash.Resource.primary_key(relationship.destination),
-         attribute <- Ash.Resource.attribute(relationship.destination, field),
-         {:ok, casted} <- Ash.Type.cast_input(attribute.type, value) do
-      {:ok, %{field => casted}}
+    error =
+      if Map.has_key?(error, :changeset) && error.changeset do
+        %{error | changeset: %{error.changeset | errors: set_path(error.changeset.errors, path)}}
+      else
+        error
+      end
+
+    if Map.has_key?(error, :errors) && is_list(error.errors) do
+      %{error | errors: Enum.map(error.errors, &set_path(&1, path))}
     else
-      _ ->
-        error =
-          InvalidRelationship.exception(
-            relationship: relationship.name,
-            message: "Invalid identifier #{inspect(value)}"
-          )
-
-        {:error, error}
+      error
     end
   end
 
-  @doc false
-  def changes_depend_on(changeset, dependency) do
-    %{changeset | change_dependencies: [dependency | changeset.change_dependencies]}
+  defp handle_error(error, %{handle_errors: nil} = changeset) do
+    %{changeset | valid?: false, errors: [error | changeset.errors]}
   end
 
-  @doc false
-  def add_requests(changeset, requests) when is_list(requests) do
-    Enum.reduce(requests, changeset, &add_requests(&2, &1))
+  defp handle_error(error, changeset) do
+    changeset
+    |> changeset.handle_errors.(error)
+    |> case do
+      :ignore ->
+        changeset
+
+      %__MODULE__{} = changeset ->
+        %{changeset | valid?: false}
+
+      {changeset, error} ->
+        %{changeset | valid?: false, errors: [error | changeset.errors]}
+
+      error ->
+        %{changeset | valid?: false, errors: [error | changeset.errors]}
+    end
   end
 
-  def add_requests(changeset, request) do
-    %{changeset | requests: [request | changeset.requests]}
+  defp to_change_error(keyword) do
+    if keyword[:field] do
+      InvalidAttribute.exception(
+        field: keyword[:field],
+        message: keyword[:message],
+        vars: keyword
+      )
+    else
+      InvalidChanges.exception(
+        fields: keyword[:fields] || [],
+        message: keyword[:message],
+        vars: keyword
+      )
+    end
+  end
+
+  defp prepare_change(%{action_type: :create}, _attribute, value, _constraints), do: {:ok, value}
+
+  defp prepare_change(changeset, attribute, value, constraints) do
+    old_value = Map.get(changeset.data, attribute.name)
+    Ash.Type.prepare_change(attribute.type, old_value, value, constraints)
+  end
+
+  defp handle_change(%{action_type: :create}, _attribute, value, _constraints), do: {:ok, value}
+
+  defp handle_change(changeset, attribute, value, constraints) do
+    old_value = Map.get(changeset.data, attribute.name)
+    Ash.Type.handle_change(attribute.type, old_value, value, constraints)
   end
 
   defp validate_allow_nil(%{allow_nil?: false} = attribute, nil) do
     {:error,
      InvalidAttribute.exception(
        field: attribute.name,
-       message: "must be present",
-       validation: {:present, 1, 1}
+       message: "must be present"
      )}
   end
 
   defp validate_allow_nil(_, _), do: :ok
 
-  defp add_attribute_invalid_error(changeset, attribute, message \\ nil) do
-    error =
-      InvalidAttribute.exception(
-        field: attribute.name,
-        validation: {:cast, attribute.type},
-        message: message
-      )
+  defp add_invalid_errors(type, changeset, attribute, message \\ nil) do
+    messages =
+      if Keyword.keyword?(message) do
+        [message]
+      else
+        List.wrap(message)
+      end
 
-    add_error(changeset, error)
+    Enum.reduce(messages, changeset, fn message, changeset ->
+      opts = error_to_exception_opts(message, attribute)
+
+      exception =
+        case type do
+          :attribute -> InvalidAttribute
+          :argument -> InvalidArgument
+        end
+
+      Enum.reduce(opts, changeset, fn opts, changeset ->
+        error =
+          exception.exception(
+            field: Keyword.get(opts, :field),
+            message: Keyword.get(opts, :message),
+            vars: opts
+          )
+
+        add_error(changeset, error)
+      end)
+    end)
+  end
+
+  @doc false
+  def error_to_exception_opts(message, attribute) do
+    case message do
+      keyword when is_list(keyword) ->
+        fields =
+          case List.wrap(keyword[:fields]) do
+            [] ->
+              List.wrap(keyword[:field])
+
+            fields ->
+              fields
+          end
+
+        fields
+        |> case do
+          [] ->
+            [
+              keyword
+              |> Keyword.put(
+                :message,
+                add_index(keyword[:message], keyword)
+              )
+              |> Keyword.put(:field, attribute.name)
+            ]
+
+          fields ->
+            Enum.map(
+              fields,
+              &Keyword.merge(message,
+                field: attribute.name,
+                message: add_index(add_field(keyword[:message], "#{&1}"), keyword)
+              )
+            )
+        end
+
+      message when is_binary(message) ->
+        [[field: attribute.name, message: message]]
+
+      _ ->
+        [[field: attribute.name]]
+    end
+  end
+
+  defp add_field(message, field) do
+    "at field #{field} " <> message
+  end
+
+  defp add_index(message, opts) do
+    if opts[:index] do
+      "at index #{opts[:index]} " <> message
+    else
+      message
+    end
   end
 end

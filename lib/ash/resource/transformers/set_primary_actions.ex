@@ -11,11 +11,30 @@ defmodule Ash.Resource.Transformers.SetPrimaryActions do
   alias Ash.Dsl.Transformer
   alias Ash.Error.Dsl.DslError
 
-  def transform(_resource, dsl_state) do
+  @extension Module.concat(["Ash", Resource, Dsl])
+
+  def transform(resource, dsl_state) do
     dsl_state
     |> Transformer.get_entities([:actions])
     |> Enum.group_by(& &1.type)
+    |> Map.put_new(:read, [])
+    |> Map.put_new(:update, [])
+    |> Map.put_new(:create, [])
+    |> Map.put_new(:destroy, [])
     |> Enum.reduce_while({:ok, dsl_state}, fn
+      {type, []}, {:ok, dsl_state} ->
+        if type in Ash.Resource.Info.default_actions(resource) do
+          {:ok, action} =
+            Transformer.build_entity(@extension, [:actions], type,
+              name: type,
+              primary?: true
+            )
+
+          {:cont, {:ok, Transformer.add_entity(dsl_state, [:actions], action)}}
+        else
+          {:cont, {:ok, dsl_state}}
+        end
+
       {type, [action]}, {:ok, dsl_state} ->
         {:cont,
          {:ok,
@@ -29,13 +48,14 @@ defmodule Ash.Resource.Transformers.SetPrimaryActions do
           )}}
 
       {type, actions}, {:ok, dsl_state} ->
-        case Enum.count(actions, & &1.primary?) do
+        case min(Enum.count(actions, & &1.primary?), 2) do
           0 ->
             {:halt,
              {:error,
               DslError.exception(
+                module: __MODULE__,
                 message:
-                  "Multiple actions of type create defined, one must be designated as `primary?: true`",
+                  "Multiple actions of type #{type} defined, one must be designated as `primary?`",
                 path: [:actions, type]
               )}}
 
@@ -46,6 +66,7 @@ defmodule Ash.Resource.Transformers.SetPrimaryActions do
             {:halt,
              {:error,
               DslError.exception(
+                module: __MODULE__,
                 message:
                   "Multiple actions of type #{type} configured as `primary?: true`, but only one action per type can be the primary",
                 path: [:actions, type]

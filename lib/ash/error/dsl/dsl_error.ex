@@ -1,13 +1,17 @@
 defmodule Ash.Error.Dsl.DslError do
   @moduledoc "Used when a DSL is incorrectly configured."
-  defexception [:message, :path]
+  defexception [:module, :message, :path]
 
-  def message(%{message: message, path: nil}) do
-    message
+  def message(%{module: module, message: message, path: nil}) do
+    "[#{normalize_module_name(module)}]\n #{message}"
   end
 
-  def message(%{message: message, path: dsl_path}) do
+  def message(%{module: module, message: message, path: dsl_path}) do
     dsl_path = Enum.join(dsl_path, " -> ")
-    "#{dsl_path}:\n  #{message}"
+    "[#{normalize_module_name(module)}]\n #{dsl_path}:\n  #{message}"
+  end
+
+  defp normalize_module_name(module) do
+    inspect(module)
   end
 end

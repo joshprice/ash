@@ -2,6 +2,8 @@ defmodule Ash.Test.Actions.DestroyTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  import Ash.Changeset
+
   defmodule Profile do
     @moduledoc false
     use Ash.Resource, data_layer: Ash.DataLayer.Ets
@@ -11,19 +13,32 @@ defmodule Ash.Test.Actions.DestroyTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
-      destroy :default
+      read :read
+      create :create
+      update :update
+      destroy :destroy
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :bio, :string
     end
 
     relationships do
       belongs_to :author, Ash.Test.Actions.DestroyTest.Author
+    end
+  end
+
+  defmodule ManualDestroyAuthor do
+    @moduledoc false
+    use Ash.Resource.Change
+
+    def change(changeset, _, _) do
+      Ash.Changeset.after_action(changeset, fn _changeset, data ->
+        Ash.Test.Actions.DestroyTest.Api.destroy!(data)
+
+        {:ok, data}
+      end)
     end
   end
 
@@ -36,14 +51,23 @@ defmodule Ash.Test.Actions.DestroyTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
-      destroy :default
+      read :read
+      create :create
+      update :update
+
+      destroy :destroy do
+        primary? true
+      end
+
+      destroy :manual do
+        accept []
+        manual? true
+        change ManualDestroyAuthor
+      end
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :name, :string
     end
 
@@ -69,14 +93,14 @@ defmodule Ash.Test.Actions.DestroyTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
-      destroy :default
+      read :read
+      create :create
+      update :update
+      destroy :destroy
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :title, :string
       attribute :contents, :string
       attribute :tag, :string, default: "garbage"
@@ -100,8 +124,6 @@ defmodule Ash.Test.Actions.DestroyTest do
     end
   end
 
-  import Ash.Changeset
-
   describe "simple destroy" do
     test "allows destroying a record" do
       post =
@@ -120,11 +142,26 @@ defmodule Ash.Test.Actions.DestroyTest do
         |> new(%{name: "foobar"})
         |> Api.create!()
 
+      start_supervised({Ash.Test.Authorizer, strict_check: :continue, check: :forbidden})
+
       assert_raise(Ash.Error.Forbidden, fn ->
         Api.destroy!(author, authorize?: true)
       end)
 
       assert Api.get!(Author, author.id)
+    end
+  end
+
+  describe "manual destroy" do
+    test "allows destroying a record" do
+      author =
+        Author
+        |> new(%{name: "foo"})
+        |> Api.create!()
+
+      assert Api.destroy!(author, action: :manual) == :ok
+
+      refute Api.get!(Author, author.id)
     end
   end
 end

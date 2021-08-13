@@ -1,11 +1,11 @@
 defmodule Ash.Error.Changes.InvalidAttribute do
   @moduledoc "Used when an invalid value is provided for an attribute change"
-  use Ash.Error
+  use Ash.Error.Exception
 
-  def_ash_error([:field, :message, :validation], class: :invalid)
+  def_ash_error([:field, :message], class: :invalid)
 
   defimpl Ash.ErrorKind do
-    def id(_), do: Ecto.UUID.generate()
+    def id(_), do: Ash.UUID.generate()
 
     def code(_), do: "invalid_attribute"
 
@@ -16,10 +16,14 @@ defmodule Ash.Error.Changes.InvalidAttribute do
     defp for_field(%{field: field}) when not is_nil(field), do: " for #{field}"
     defp for_field(_), do: ""
 
-    defp do_message(%{message: message}) when not is_nil(message) do
+    defp do_message(%{message: ""} = error), do: do_message(%{error | message: nil})
+
+    defp do_message(%{message: message}) when is_binary(message) do
       ": #{message}."
     end
 
-    defp do_message(_), do: "."
+    defp do_message(_other) do
+      "."
+    end
   end
 end

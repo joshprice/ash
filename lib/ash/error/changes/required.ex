@@ -1,11 +1,11 @@
 defmodule Ash.Error.Changes.Required do
   @moduledoc "Used when an attrbute or relationship is required"
-  use Ash.Error
+  use Ash.Error.Exception
 
-  def_ash_error([:field, :type], class: :invalid)
+  def_ash_error([:field, :type, :resource], class: :invalid)
 
   defimpl Ash.ErrorKind do
-    def id(_), do: Ecto.UUID.generate()
+    def id(_), do: Ash.UUID.generate()
 
     def code(_), do: "required"
 

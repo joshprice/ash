@@ -9,7 +9,7 @@ defmodule Ash.Test.Resource.ValidationsTest do
         use Ash.Resource
 
         attributes do
-          attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+          uuid_primary_key :id
 
           attribute :name, :string
           attribute :contents, :string
@@ -34,7 +34,7 @@ defmodule Ash.Test.Resource.ValidationsTest do
                    {Ash.Resource.Validation.Present,
                     [attributes: [:name, :contents], at_least: 1]}
                }
-             ] = Ash.Resource.validations(Post)
+             ] = Ash.Resource.Info.validations(Post)
     end
 
     test "Validation descriptions are allowed" do
@@ -47,7 +47,7 @@ defmodule Ash.Test.Resource.ValidationsTest do
 
       assert [
                %Ash.Resource.Validation{description: "require one of name/contents"}
-             ] = Ash.Resource.validations(Post)
+             ] = Ash.Resource.Info.validations(Post)
     end
   end
 end

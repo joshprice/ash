@@ -1,11 +1,11 @@
 defmodule Ash.Error.Changes.InvalidRelationship do
   @moduledoc "Used when an invalid value is provided for a relationship change"
-  use Ash.Error
+  use Ash.Error.Exception
 
   def_ash_error([:relationship, :message], class: :invalid)
 
   defimpl Ash.ErrorKind do
-    def id(_), do: Ecto.UUID.generate()
+    def id(_), do: Ash.UUID.generate()
 
     def code(_), do: "invalid_relationship"
 

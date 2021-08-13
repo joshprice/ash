@@ -11,8 +11,16 @@ defmodule Ash.Resource.Relationships.ManyToMany do
     :destination_field_on_join_table,
     :join_relationship,
     :join_attributes,
+    :not_found_message,
+    :violation_message,
     :writable?,
+    :private?,
+    :sort,
+    :read_action,
     :description,
+    :context,
+    :filter,
+    validate_destination_field?: true,
     cardinality: :many,
     type: :many_to_many
   ]
@@ -20,11 +28,14 @@ defmodule Ash.Resource.Relationships.ManyToMany do
   @type t :: %__MODULE__{
           type: :many_to_many,
           cardinality: :many,
-          source: Ash.resource(),
+          source: Ash.Resource.t(),
           writable?: boolean,
+          private?: boolean,
+          filter: Ash.Filter.t(),
+          read_action: atom,
           name: atom,
-          through: Ash.resource(),
-          destination: Ash.resource(),
+          through: Ash.Resource.t(),
+          destination: Ash.Resource.t(),
           join_relationship: atom,
           join_attributes: [atom],
           source_field: atom,
@@ -53,7 +64,7 @@ defmodule Ash.Resource.Relationships.ManyToMany do
                     type: :atom,
                     required: true,
                     doc:
-                      "The field on the join table that should line up with `destination_field` on the related resource. Default: [relationshihp_name]_id"
+                      "The field on the join table that should line up with `destination_field` on the related resource."
                   ],
                   through: [
                     type: :atom,

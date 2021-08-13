@@ -12,7 +12,7 @@ defmodule Ash.Api.Transformers.ValidateManyToManyJoinAttributes do
     |> Enum.map(& &1.resource)
     |> Enum.each(fn resource ->
       resource
-      |> Ash.Resource.relationships()
+      |> Ash.Resource.Info.relationships()
       |> Enum.filter(&(&1.type == :many_to_many && &1.join_attributes != []))
       |> Enum.each(&validate_relationship/1)
     end)
@@ -23,17 +23,16 @@ defmodule Ash.Api.Transformers.ValidateManyToManyJoinAttributes do
   defp validate_relationship(relationship) do
     through_attributes =
       relationship.through
-      |> Ash.Resource.attributes()
+      |> Ash.Resource.Info.attributes()
       |> Enum.map(& &1.name)
 
     for join_attribute <- relationship.join_attributes do
       unless join_attribute in through_attributes do
         raise Ash.Error.Dsl.DslError,
+          module: __MODULE__,
           path: [:relationships, relationship.name],
           message:
-            "Relationship `#{relationship.name}` expects join_attribute `#{join_attribute}` to be defined on the `through` resource #{
-              inspect(relationship.through)
-            }"
+            "Relationship `#{relationship.name}` expects join_attribute `#{join_attribute}` to be defined on the `through` resource #{inspect(relationship.through)}"
       end
     end
   end

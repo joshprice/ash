@@ -1,24 +1,53 @@
 defmodule Ash.Actions.Update do
   @moduledoc false
-  alias Ash.Actions.Relationships
+
+  alias Ash.Actions.Helpers
   alias Ash.Engine
   alias Ash.Engine.Request
+
   require Logger
 
-  alias Ash.Error.Changes.{InvalidAttribute, InvalidRelationship}
-
-  @spec run(Ash.api(), Ash.record(), Ash.action(), Keyword.t()) ::
-          {:ok, Ash.record()} | {:error, Ash.Changeset.t()} | {:error, Ash.error()}
+  @spec run(Ash.Api.t(), Ash.Resource.record(), Ash.Resource.Actions.action(), Keyword.t()) ::
+          {:ok, Ash.Resource.record(), list(Ash.Notifier.Notification.t())}
+          | {:ok, Ash.Resource.record()}
+          | {:error, Ash.Changeset.t()}
+          | {:error, term}
   def run(api, changeset, action, opts) do
+    authorize? =
+      if opts[:authorize?] == false do
+        false
+      else
+        opts[:authorize?] || Keyword.has_key?(opts, :actor)
+      end
+
+    opts = Keyword.put(opts, :authorize?, authorize?)
+
+    opts =
+      case Map.fetch(changeset.context[:private] || %{}, :actor) do
+        {:ok, actor} ->
+          Keyword.put_new(opts, :actor, actor)
+
+        _ ->
+          opts
+      end
+
     engine_opts =
       opts
       |> Keyword.take([:verbose?, :actor, :authorize?])
       |> Keyword.put(:transaction?, true)
 
-    resource = changeset.resource
+    changeset =
+      if opts[:tenant] do
+        Ash.Changeset.set_tenant(changeset, opts[:tenant])
+      else
+        changeset
+      end
 
-    with %{valid?: true} = changeset <- changeset(changeset, api, action, opts[:actor]),
-         %{data: %{commit: %^resource{} = updated}, errors: []} <-
+    resource = changeset.resource
+    changeset = changeset(changeset, api, action, opts[:actor])
+
+    with %{valid?: true} <- Ash.Changeset.validate_multitenancy(changeset),
+         {:ok, %{data: %{commit: %^resource{} = updated}} = engine_result} <-
            do_run_requests(
              changeset,
              engine_opts,
@@ -26,92 +55,50 @@ defmodule Ash.Actions.Update do
              resource,
              api
            ) do
-      {:ok, updated}
+      add_notifications(updated, engine_result, opts)
     else
-      %Ash.Changeset{errors: errors} ->
-        {:error, Ash.Error.to_ash_error(errors)}
+      %Ash.Changeset{errors: errors} = changeset ->
+        {:error, Ash.Error.to_error_class(errors, changeset: changeset)}
 
-      %{errors: errors} ->
-        {:error, Ash.Error.to_ash_error(errors)}
+      {:error, %Ash.Engine.Runner{errors: errors, changeset: runner_changeset}} ->
+        errors = Helpers.process_errors(changeset, errors)
+        {:error, Ash.Error.to_error_class(errors, changeset: runner_changeset || changeset)}
 
       {:error, error} ->
-        {:error, Ash.Error.to_ash_error(error)}
+        error = Helpers.process_errors(changeset, error)
+        {:error, Ash.Error.to_error_class(error, changeset: changeset)}
+    end
+  end
+
+  defp add_tenant({:ok, data}, changeset) do
+    if changeset.tenant do
+      {:ok, %{data | __metadata__: Map.put(data.__metadata__, :tenant, changeset.tenant)}}
+    else
+      {:ok, data}
+    end
+  end
+
+  defp add_tenant(other, _changeset) do
+    other
+  end
+
+  defp add_notifications(result, engine_result, opts) do
+    if opts[:return_notifications?] do
+      {:ok, result, Map.get(engine_result, :resource_notifications, [])}
+    else
+      {:ok, result}
     end
   end
 
   defp changeset(changeset, api, action, actor) do
-    %{changeset | api: api}
-    |> validate_attributes_accepted(action)
-    |> validate_relationships_accepted(action)
-    |> run_action_changes(action, actor)
-    |> Relationships.handle_relationship_changes()
-    |> set_defaults()
-    |> add_validations()
-  end
+    changeset = %{changeset | api: api}
 
-  defp run_action_changes(changeset, %{changes: changes}, actor) do
-    Enum.reduce(changes, changeset, fn %{change: {module, opts}}, changeset ->
-      module.change(changeset, opts, %{actor: actor})
-    end)
-  end
-
-  defp validate_attributes_accepted(changeset, %{accept: nil}), do: changeset
-
-  defp validate_attributes_accepted(changeset, %{accept: accepted_attributes}) do
-    changeset.attributes
-    |> Enum.reject(fn {key, _value} ->
-      key in accepted_attributes
-    end)
-    |> Enum.reduce(changeset, fn {key, _}, changeset ->
-      Ash.Changeset.add_error(
-        changeset,
-        InvalidAttribute.exception(field: key, message: "Cannot be changed")
-      )
-    end)
-  end
-
-  defp validate_relationships_accepted(changeset, %{accept: nil}), do: changeset
-
-  defp validate_relationships_accepted(changeset, %{accept: accepted_relationships}) do
-    changeset.relationships
-    |> Enum.reject(fn {key, _value} ->
-      key in accepted_relationships
-    end)
-    |> Enum.reduce(changeset, fn {key, _}, changeset ->
-      Ash.Changeset.add_error(
-        changeset,
-        InvalidRelationship.exception(
-          relationship: key,
-          message: "Cannot be changed"
-        )
-      )
-    end)
-  end
-
-  defp add_validations(changeset) do
-    changeset.resource()
-    |> Ash.Resource.validations(changeset.action_type)
-    |> Enum.reduce(changeset, fn validation, changeset ->
-      Ash.Changeset.before_action(changeset, &do_validation(&1, validation))
-    end)
-  end
-
-  defp do_validation(changeset, validation) do
-    case validation.module.validate(changeset, validation.opts) do
-      :ok -> changeset
-      {:error, error} -> Ash.Changeset.add_error(changeset, error)
+    if changeset.__validated_for_action__ == action.name do
+      changeset
+    else
+      Ash.Changeset.for_update(changeset, action.name, %{}, actor: actor)
     end
-  end
-
-  defp set_defaults(changeset) do
-    changeset.resource
-    |> Ash.Resource.attributes()
-    |> Enum.filter(&(not is_nil(&1.update_default)))
-    |> Enum.reduce(changeset, fn attribute, changeset ->
-      Ash.Changeset.change_new_attribute_lazy(changeset, attribute.name, fn ->
-        default(attribute.update_default)
-      end)
-    end)
+    |> Ash.Changeset.set_defaults(:update, true)
   end
 
   defp do_run_requests(
@@ -124,10 +111,11 @@ defmodule Ash.Actions.Update do
     authorization_request =
       Request.new(
         api: api,
-        changeset: Relationships.changeset(changeset),
+        changeset: changeset,
         action: action,
         resource: resource,
         data: changeset.data,
+        authorize?: false,
         path: :data,
         name: "#{action.type} - `#{action.name}`: prepare"
       )
@@ -141,29 +129,137 @@ defmodule Ash.Actions.Update do
           end),
         action: action,
         resource: resource,
+        notify?: true,
+        manage_changeset?: true,
+        authorize?: false,
         data:
           Request.resolve(
             [[:data, :changeset]],
             fn %{data: %{changeset: changeset}} ->
-              Ash.Changeset.with_hooks(changeset, fn changeset ->
-                Ash.DataLayer.update(resource, changeset)
-              end)
+              result =
+                changeset
+                |> Ash.Changeset.put_context(:private, %{actor: engine_opts[:actor]})
+                |> Ash.Changeset.before_action(
+                  &Ash.Actions.ManagedRelationships.setup_managed_belongs_to_relationships(
+                    &1,
+                    engine_opts[:actor],
+                    engine_opts
+                  )
+                )
+                |> Ash.Changeset.with_hooks(fn changeset ->
+                  case Ash.Actions.ManagedRelationships.setup_managed_belongs_to_relationships(
+                         changeset,
+                         engine_opts[:actor],
+                         engine_opts
+                       ) do
+                    {:error, error} ->
+                      {:error, error}
+
+                    {changeset, manage_instructions} ->
+                      changeset =
+                        changeset
+                        |> Ash.Changeset.require_values(
+                          :update,
+                          true
+                        )
+                        |> Ash.Changeset.require_values(
+                          :update,
+                          false,
+                          action.require_attributes
+                        )
+
+                      changeset = set_tenant(changeset)
+
+                      if changeset.valid? do
+                        if action.manual? do
+                          {:ok, changeset.data, %{notifications: []}}
+                        else
+                          resource
+                          |> Ash.DataLayer.update(changeset)
+                          |> add_tenant(changeset)
+                          |> manage_relationships(api, changeset, engine_opts)
+                        end
+                        |> case do
+                          {:ok, result, notifications} ->
+                            {:ok, result,
+                             Map.update!(
+                               notifications,
+                               :notifications,
+                               &(&1 ++ manage_instructions.notifications)
+                             )}
+
+                          {:error, error} ->
+                            {:error, error}
+                        end
+                      else
+                        {:error, changeset.errors}
+                      end
+                  end
+                end)
+
+              case result do
+                {:ok, updated, changeset, instructions} ->
+                  if action.manual? do
+                    updated = updated || changeset.data
+
+                    {:ok, updated}
+                    |> add_tenant(changeset)
+                    |> manage_relationships(api, changeset, engine_opts)
+                    |> case do
+                      {:ok, data, %{notifications: new_notifications}} ->
+                        {:ok, data,
+                         Map.update!(instructions, :notifications, &(&1 ++ new_notifications))}
+
+                      {:error, error} ->
+                        {:error, error}
+                    end
+                  else
+                    {:ok, updated, instructions}
+                  end
+
+                other ->
+                  other
+              end
             end
           ),
         path: [:commit],
         name: "#{action.type} - `#{action.name}` commit"
       )
 
-    relationship_requests = changeset.requests
-
     Engine.run(
-      [authorization_request | [commit_request | relationship_requests]],
+      [authorization_request, commit_request],
       api,
       engine_opts
     )
   end
 
-  defp default({mod, func, args}), do: apply(mod, func, args)
-  defp default(function) when is_function(function, 0), do: function.()
-  defp default(value), do: value
+  defp manage_relationships({:ok, updated}, api, changeset, engine_opts) do
+    with {:ok, loaded} <-
+           Ash.Actions.ManagedRelationships.load(api, updated, changeset, engine_opts),
+         {:ok, with_relationships, new_notifications} <-
+           Ash.Actions.ManagedRelationships.manage_relationships(
+             loaded,
+             changeset,
+             engine_opts[:actor],
+             engine_opts
+           ) do
+      {:ok, Helpers.select(with_relationships, changeset), %{notifications: new_notifications}}
+    end
+  end
+
+  defp manage_relationships(other, _, _, _), do: other
+
+  defp set_tenant(changeset) do
+    if changeset.tenant &&
+         Ash.Resource.Info.multitenancy_strategy(changeset.resource) == :attribute do
+      attribute = Ash.Resource.Info.multitenancy_attribute(changeset.resource)
+
+      {m, f, a} = Ash.Resource.Info.multitenancy_parse_attribute(changeset.resource)
+      attribute_value = apply(m, f, [changeset.tenant | a])
+
+      Ash.Changeset.force_change_attribute(changeset, attribute, attribute_value)
+    else
+      changeset
+    end
+  end
 end

@@ -40,21 +40,11 @@ defmodule Ash.Dsl.Entity do
     entities: [],
     describe: "",
     args: [],
+    hide: [],
+    modules: [],
     schema: [],
     auto_set_fields: []
   ]
-
-  @type t :: %__MODULE__{
-          name: atom,
-          describe: String.t(),
-          target: module,
-          examples: [String.t()],
-          transform: mfa | nil,
-          args: [atom],
-          entities: Keyword.t(),
-          auto_set_fields: Keyword.t(),
-          schema: NimbleOptions.schema()
-        }
 
   def build(
         %{target: target, schema: schema, auto_set_fields: auto_set_fields, transform: transform},
@@ -65,8 +55,9 @@ defmodule Ash.Dsl.Entity do
       Keyword.split(auto_set_fields || [], Keyword.keys(schema))
 
     with {:ok, opts} <-
-           NimbleOptions.validate(Keyword.merge(opts || [], before_validate_auto), schema),
+           Ash.OptionsHelpers.validate(Keyword.merge(opts || [], before_validate_auto), schema),
          opts <- Keyword.merge(opts, after_validate_auto),
+         opts <- Enum.map(opts, fn {key, value} -> {schema[key][:as] || key, value} end),
          built <- struct(target, opts),
          built <- struct(built, nested_entities),
          {:ok, built} <-
@@ -79,53 +70,5 @@ defmodule Ash.Dsl.Entity do
 
   defp transform({module, function, args}, built) do
     apply(module, function, [built | args])
-  end
-
-  def describe(entity, depth \\ 2) do
-    args_description =
-      case Keyword.take(entity.schema, entity.args) do
-        [] ->
-          ""
-
-        args_schema ->
-          args_schema =
-            Enum.map(args_schema, fn {key, value} ->
-              {key, Keyword.drop(value, [:required, :default])}
-            end)
-
-          "\n" <>
-            header("Arguments", depth) <>
-            NimbleOptions.docs(args_schema)
-      end
-
-    opts_description =
-      case Keyword.drop(entity.schema, entity.args) do
-        [] ->
-          ""
-
-        opts_schema ->
-          "\n" <>
-            header("Options", depth) <>
-            NimbleOptions.docs(opts_schema)
-      end
-
-    example_docs =
-      case entity.examples do
-        [] ->
-          ""
-
-        examples ->
-          "\n" <>
-            header("Examples", depth) <>
-            Enum.map_join(examples, "\n", fn example ->
-              "```elixir\n" <> example <> "\n```\n"
-            end)
-      end
-
-    entity.describe <> "\n" <> example_docs <> args_description <> opts_description
-  end
-
-  defp header(header, depth) do
-    String.duplicate("#", depth) <> " " <> header <> "\n\n"
   end
 end

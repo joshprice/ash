@@ -4,10 +4,18 @@ defmodule Ash.Resource.Relationships.HasMany do
     :name,
     :destination,
     :destination_field,
+    :private?,
     :source_field,
     :source,
+    :context,
     :writable?,
     :description,
+    :filter,
+    :sort,
+    :read_action,
+    :not_found_message,
+    :violation_message,
+    validate_destination_field?: true,
     cardinality: :many,
     type: :has_many
   ]
@@ -15,12 +23,15 @@ defmodule Ash.Resource.Relationships.HasMany do
   @type t :: %__MODULE__{
           type: :has_many,
           cardinality: :many,
-          source: Ash.resource(),
+          source: Ash.Resource.t(),
           writable?: boolean,
+          read_action: atom,
+          filter: Ash.Filter.t(),
           name: atom,
           type: Ash.Type.t(),
-          destination: Ash.resource(),
+          destination: Ash.Resource.t(),
           destination_field: atom,
+          private?: boolean,
           source_field: atom,
           description: String.t()
         }
@@ -29,7 +40,6 @@ defmodule Ash.Resource.Relationships.HasMany do
   alias Ash.OptionsHelpers
 
   @global_opts shared_options()
-               |> OptionsHelpers.make_required!(:destination_field)
                |> OptionsHelpers.set_default!(:source_field, :id)
 
   @opt_schema Ash.OptionsHelpers.merge_schemas(

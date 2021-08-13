@@ -1,11 +1,4 @@
 defmodule Ash.Api.Dsl do
-  @moduledoc """
-  A small DSL for declaring APIs
-
-  Apis are the entrypoints for working with your resources.
-
-  * resources - `resources/1`
-  """
   @resource %Ash.Dsl.Entity{
     name: :resource,
     describe: "A reference to a resource",
@@ -14,7 +7,23 @@ defmodule Ash.Api.Dsl do
     examples: [
       "resource MyApp.User"
     ],
+    # This is an internal tool used by embedded resources,
+    # so we hide it from the documentation
+    hide: [:warn_on_compile_failure?],
     schema: [
+      warn_on_compile_failure?: [
+        type: :atom,
+        default: true
+      ],
+      as: [
+        type: :atom,
+        required: false,
+        doc: """
+        A short name for the resource.
+
+        Can be used in calls to Api modules, e.g `Api.read(:special_thing)`.
+        """
+      ],
       resource: [
         type: :atom,
         required: true,
@@ -26,17 +35,40 @@ defmodule Ash.Api.Dsl do
   @resources %Ash.Dsl.Section{
     name: :resources,
     describe: "List the resources present in this API",
+    examples: [
+      """
+      resources do
+        resource MyApp.User
+        resource MyApp.Post
+        resource MyApp.Comment
+      end
+      """
+    ],
     entities: [
       @resource
     ]
   }
 
   @transformers [
-    Ash.Api.Transformers.EnsureResourcesCompiled,
-    Ash.Api.Transformers.ValidateRelatedResourceInclusion,
-    Ash.Api.Transformers.ValidateRelationshipAttributes,
-    Ash.Api.Transformers.ValidateManyToManyJoinAttributes
-  ]
+                  EnsureResourcesCompiled,
+                  ValidateRelatedResourceInclusion,
+                  ValidateRelationshipAttributes,
+                  ValidateManyToManyJoinAttributes
+                ]
+                |> Enum.map(&Module.concat(["Ash", Api, Transformers, &1]))
 
-  use Ash.Dsl.Extension, sections: [@resources], transformers: @transformers
+  @sections [@resources]
+
+  @moduledoc """
+  A small DSL for declaring APIs
+
+  Apis are the entrypoints for working with your resources.
+
+  # Table of Contents
+  #{Ash.Dsl.Extension.doc_index(@sections)}
+
+  #{Ash.Dsl.Extension.doc(@sections)}
+  """
+
+  use Ash.Dsl.Extension, sections: @sections, transformers: @transformers
 end

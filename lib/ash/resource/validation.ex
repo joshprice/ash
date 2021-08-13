@@ -2,7 +2,7 @@ defmodule Ash.Resource.Validation do
   @moduledoc """
   Represents a validation in Ash.
 
-  See `Ash.Resource.Validation.Builtin` for a list of builtin validations.
+  See `Ash.Resource.Validation.Builtins` for a list of builtin validations.
 
   To write your own validation, define a module that implements the `c:init/1` callback
   to validate options at compile time, and `c:validate/2` callback to do the validation.
@@ -39,7 +39,16 @@ defmodule Ash.Resource.Validation do
   end
   ```
   """
-  defstruct [:validation, :module, :opts, :expensive?, :description, on: []]
+  defstruct [
+    :validation,
+    :module,
+    :opts,
+    :expensive?,
+    :description,
+    :message,
+    :before_action?,
+    on: []
+  ]
 
   @type t :: %__MODULE__{
           validation: {atom(), list(atom())},
@@ -52,7 +61,7 @@ defmodule Ash.Resource.Validation do
 
   @type path :: [atom | integer]
   @callback init(Keyword.t()) :: {:ok, Keyword.t()} | {:error, String.t()}
-  @callback validate(Ash.changeset(), Keyword.t()) :: :ok | {:error, Ash.error()}
+  @callback validate(Ash.Changeset.t(), Keyword.t()) :: :ok | {:error, term}
 
   @schema [
     validation: [
@@ -75,17 +84,40 @@ defmodule Ash.Resource.Validation do
       doc:
         "If a validation is expensive, it won't be run on invalid changes. All inexpensive validations are always run, to provide informative errors."
     ],
+    message: [
+      type: :string,
+      doc: "If provided, overrides any message set by the validation error"
+    ],
     description: [
       type: :string,
       doc: "An optional description for the validation"
+    ],
+    before_action?: [
+      type: :boolean,
+      default: false,
+      doc:
+        "If set to `true`, the validation is not run when building changesets using `Ash.Changeset.for_*`. The validation will only ever be run once the action itself is called."
     ]
   ]
+
+  @action_schema Keyword.delete(@schema, :on)
+
+  defmacro __using__(_) do
+    quote do
+      @behaviour Ash.Resource.Validation
+
+      def init(opts), do: {:ok, opts}
+
+      defoverridable init: 1
+    end
+  end
 
   def transform(%__MODULE__{validation: {module, opts}} = validation) do
     {:ok, %{validation | module: module, opts: opts}}
   end
 
   def opt_schema, do: @schema
+  def action_schema, do: @action_schema
 
   def on(list) do
     list

@@ -1,6 +1,7 @@
 defmodule Ash.Test.Type.TypeTest do
   @moduledoc false
   use ExUnit.Case, async: true
+  import Ash.Changeset
 
   defmodule PostTitle do
     @moduledoc false
@@ -19,13 +20,14 @@ defmodule Ash.Test.Type.TypeTest do
 
     def apply_constraints(value, constraints) do
       if constraints[:max_length] && String.length(value) >= constraints[:max_length] do
-        {:error, "is too long, max_length is #{inspect(constraints[:max_length])}"}
+        {:error,
+         message: "is too long, max_length is %{max_length}", max_length: constraints[:max_length]}
       else
         :ok
       end
     end
 
-    def cast_input(value) when is_bitstring(value) do
+    def cast_input(value, _) when is_binary(value) do
       if String.match?(value, ~r/[a-zA-Z\w]*/) do
         {:ok, value}
       else
@@ -33,13 +35,13 @@ defmodule Ash.Test.Type.TypeTest do
       end
     end
 
-    def cast_input(_), do: :error
+    def cast_input(_, _), do: :error
 
-    def cast_stored(value) when is_bitstring(value), do: value
-    def cast_stored(_), do: :error
+    def cast_stored(value, _) when is_binary(value), do: value
+    def cast_stored(_, _), do: :error
 
-    def dump_to_native(value) when is_bitstring(value), do: value
-    def dump_to_native(_), do: :error
+    def dump_to_native(value, _) when is_binary(value), do: value
+    def dump_to_native(_, _), do: :error
   end
 
   defmodule Post do
@@ -51,13 +53,14 @@ defmodule Ash.Test.Type.TypeTest do
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :title, PostTitle, constraints: [max_length: 10]
+      attribute :post_type, :atom, allow_nil?: false, constraints: [one_of: [:text, :video]]
     end
 
     actions do
-      create :default
-      read :default
+      create :create
+      read :read
     end
   end
 
@@ -70,21 +73,27 @@ defmodule Ash.Test.Type.TypeTest do
     end
   end
 
-  import Ash.Changeset
-
   test "it accepts valid data" do
     post =
       Post
-      |> new(%{title: "foobar"})
+      |> new(%{title: "foobar", post_type: :text})
       |> Api.create!()
 
     assert post.title == "foobar"
   end
 
-  test "it rejects invalid data" do
+  test "it rejects invalid title data" do
     assert_raise(Ash.Error.Invalid, ~r/is too long, max_length is 10/, fn ->
       Post
-      |> new(%{title: "foobarbazbuzbiz"})
+      |> new(%{title: "foobarbazbuzbiz", post_type: :text})
+      |> Api.create!()
+    end)
+  end
+
+  test "it rejects invalid atom data" do
+    assert_raise(Ash.Error.Invalid, ~r/atom must be one of/, fn ->
+      Post
+      |> new(%{title: "foobar", post_type: :something_else})
       |> Api.create!()
     end)
   end

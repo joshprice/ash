@@ -16,7 +16,7 @@ defmodule Ash.Type.Integer do
 
   ### Constraints
 
-  #{NimbleOptions.docs(@constraints)}
+  #{Ash.OptionsHelpers.docs(@constraints)}
   """
   use Ash.Type
 
@@ -37,14 +37,14 @@ defmodule Ash.Type.Integer do
       Enum.reduce(constraints, [], fn
         {:max, max}, errors ->
           if value > max do
-            ["must be less than `#{max}`" | errors]
+            [[message: "must be less than or equal to %{max}", max: max] | errors]
           else
             errors
           end
 
         {:min, min}, errors ->
           if value < min do
-            ["must be more than `#{min}`" | errors]
+            [[message: "must be more than or equal to %{min}", min: min] | errors]
           else
             errors
           end
@@ -57,27 +57,27 @@ defmodule Ash.Type.Integer do
   end
 
   @impl true
-  def cast_input(value) do
+  def cast_input(value, _) do
     Ecto.Type.cast(:integer, value)
   end
 
   @impl true
-  def cast_stored(string) when is_binary(string) do
+  def cast_stored(string, constraints) when is_binary(string) do
     case Integer.parse(string) do
       {integer, ""} ->
-        cast_stored(integer)
+        cast_stored(integer, constraints)
 
       _ ->
         :error
     end
   end
 
-  def cast_stored(value) do
+  def cast_stored(value, _) do
     Ecto.Type.load(:integer, value)
   end
 
   @impl true
-  def dump_to_native(value) do
+  def dump_to_native(value, _) do
     Ecto.Type.dump(:integer, value)
   end
 end

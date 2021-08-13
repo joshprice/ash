@@ -1,11 +1,11 @@
 defmodule Ash.Error.Framework do
   @moduledoc "Used when an unknown/generic framework error occurs"
-  use Ash.Error
+  use Ash.Error.Exception
 
-  def_ash_error([:errors, :stacktraces?], class: :framework)
+  def_ash_error([:errors, stacktraces?: true], class: :framework)
 
   defimpl Ash.ErrorKind do
-    def id(_), do: Ecto.UUID.generate()
+    def id(_), do: Ash.UUID.generate()
 
     def code(_), do: "framework"
 

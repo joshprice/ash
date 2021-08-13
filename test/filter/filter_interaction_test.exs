@@ -1,9 +1,12 @@
 defmodule Ash.Test.Filter.FilterInteractionTest do
   use ExUnit.Case, async: false
 
+  import Ash.Changeset
   import ExUnit.CaptureLog
 
   alias Ash.DataLayer.Mnesia
+
+  require Ash.Query
 
   defmodule Profile do
     @moduledoc false
@@ -14,13 +17,13 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
     end
 
     actions do
-      read(:default)
-      create(:default)
-      update(:default)
+      read(:read)
+      create(:create)
+      update(:update)
     end
 
     attributes do
-      attribute(:id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0)
+      uuid_primary_key :id
       attribute(:bio, :string)
     end
 
@@ -38,13 +41,13 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
     end
 
     actions do
-      read(:default)
-      create(:default)
-      update(:default)
+      read(:read)
+      create(:create)
+      update(:update)
     end
 
     attributes do
-      attribute(:id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0)
+      uuid_primary_key :id
       attribute(:name, :string)
       attribute(:allow_second_author, :boolean)
     end
@@ -65,16 +68,22 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
     use Ash.Resource, data_layer: Ash.DataLayer.Mnesia
 
     actions do
-      read(:default)
+      read(:read)
 
-      create(:default)
-      update(:default)
+      create(:create)
+      update(:update)
     end
 
     relationships do
-      belongs_to(:source_post, Ash.Test.Filter.FilterInteractionTest.Post, primary_key?: true)
+      belongs_to(:source_post, Ash.Test.Filter.FilterInteractionTest.Post,
+        primary_key?: true,
+        required?: true
+      )
 
-      belongs_to(:destination_post, Ash.Test.Filter.FilterInteractionTest.Post, primary_key?: true)
+      belongs_to(:destination_post, Ash.Test.Filter.FilterInteractionTest.Post,
+        primary_key?: true,
+        required?: true
+      )
     end
   end
 
@@ -83,17 +92,17 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
     use Ash.Resource, data_layer: Ash.DataLayer.Mnesia
 
     actions do
-      read(:default)
+      read(:read)
 
-      create(:default)
+      create(:create)
 
-      update(:default)
+      update(:update)
 
-      destroy(:default)
+      destroy(:destroy)
     end
 
     attributes do
-      attribute(:id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0)
+      uuid_primary_key :id
       attribute(:title, :string)
       attribute(:contents, :string)
       attribute(:points, :integer)
@@ -138,8 +147,6 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
     end)
   end
 
-  import Ash.Changeset
-
   test "mnesia data layer sanity test" do
     post =
       Post
@@ -172,17 +179,17 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
         |> replace_relationship(:author, author)
         |> Api.create!()
 
+      post1_id = post1.id
+
       Post
       |> new(%{title: "worst"})
       |> Api.create!()
 
-      post1 = Api.reload!(post1)
-
       query =
         Post
-        |> Ash.Query.filter(author: [name: "best author"])
+        |> Ash.Query.filter(author.name == "best author")
 
-      assert [^post1] = Api.read!(query)
+      assert [%{id: ^post1_id}] = Api.read!(query)
     end
 
     test "parallelizable filtering of related resources with a data layer that cannot join" do
@@ -203,14 +210,14 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
 
       query =
         Post
-        |> Ash.Query.filter(related_posts: [title: "two"])
+        |> Ash.Query.filter(related_posts.title == "two")
 
-      post1 = Api.reload!(post1)
+      post1_id = post1.id
 
-      assert [^post1] = Api.read!(query)
+      assert [%{id: ^post1_id}] = Api.read!(query)
     end
 
-    test "parallelizable filter with filtered side loads" do
+    test "parallelizable filter with filtered loads" do
       post2 =
         Post
         |> new(%{title: "two"})
@@ -229,11 +236,11 @@ defmodule Ash.Test.Filter.FilterInteractionTest do
 
       posts_query =
         Post
-        |> Ash.Query.filter(title: "three")
+        |> Ash.Query.filter(title == "three")
 
       query =
         Post
-        |> Ash.Query.filter(related_posts: [title: "two"])
+        |> Ash.Query.filter(related_posts.title == "two")
         |> Ash.Query.load(related_posts: posts_query)
 
       post1_id = post1.id

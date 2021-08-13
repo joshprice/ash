@@ -2,7 +2,12 @@ defmodule Ash.Test.Actions.UpdateTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  import Ash.Changeset
+  import Ash.Test.Helpers
+  require Ash.Query
+
   defmodule Authorized do
+    @moduledoc false
     use Ash.Resource,
       data_layer: Ash.DataLayer.Ets,
       authorizers: [Ash.Test.Authorizer]
@@ -12,14 +17,14 @@ defmodule Ash.Test.Actions.UpdateTest do
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :name, :string
     end
 
     actions do
-      read :default
-      create :default
-      update :default
+      read :read
+      create :create
+      update :update
     end
   end
 
@@ -32,14 +37,25 @@ defmodule Ash.Test.Actions.UpdateTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
+      read :read
+      create :create
+      update :update, primary?: true
+
+      update :set_private_attribute_to_nil do
+        change set_attribute(:non_nil_private, nil)
+      end
+
+      update :set_private_attribute_from_arg do
+        argument :private, :string
+        change set_attribute(:private, {:arg, :private})
+      end
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
-      attribute :bio, :string
+      uuid_primary_key :id
+      attribute :bio, :string, allow_nil?: false
+      attribute :non_nil_private, :string, allow_nil?: false, default: "non_nil"
+      attribute :private, :string, default: "non_nil"
     end
 
     relationships do
@@ -48,6 +64,7 @@ defmodule Ash.Test.Actions.UpdateTest do
   end
 
   defmodule DuplicateName do
+    @moduledoc false
     use Ash.Resource.Change
 
     def change(changeset, _, _) do
@@ -55,6 +72,21 @@ defmodule Ash.Test.Actions.UpdateTest do
         :error -> changeset
         {:ok, name} -> Ash.Changeset.change_attribute(changeset, :name, name <> name)
       end
+    end
+  end
+
+  defmodule ManualUpdateAuthor do
+    @moduledoc false
+    use Ash.Resource.Change
+
+    def change(changeset, _, _) do
+      Ash.Changeset.after_action(changeset, fn _changeset, data ->
+        {:ok,
+         data
+         |> Ash.Changeset.new()
+         |> Ash.Changeset.change_attribute(:name, "manual")
+         |> Ash.Test.Actions.UpdateTest.Api.update!()}
+      end)
     end
   end
 
@@ -67,9 +99,9 @@ defmodule Ash.Test.Actions.UpdateTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default, primary?: true
+      read :read
+      create :create
+      update :update, primary?: true
 
       update :only_allow_name do
         accept([:name])
@@ -78,10 +110,16 @@ defmodule Ash.Test.Actions.UpdateTest do
       update :duplicate_name do
         change {DuplicateName, []}
       end
+
+      update :manual_update do
+        accept []
+        manual? true
+        change ManualUpdateAuthor
+      end
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :name, :string
       attribute :bio, :string
     end
@@ -106,15 +144,20 @@ defmodule Ash.Test.Actions.UpdateTest do
     end
 
     actions do
-      read :default
+      read :read
 
-      create :default
-      update :default
+      create :create
+      update :update
     end
 
     relationships do
-      belongs_to :source_post, Ash.Test.Actions.UpdateTest.Post, primary_key?: true
-      belongs_to :destination_post, Ash.Test.Actions.UpdateTest.Post, primary_key?: true
+      belongs_to :source_post, Ash.Test.Actions.UpdateTest.Post,
+        primary_key?: true,
+        required?: true
+
+      belongs_to :destination_post, Ash.Test.Actions.UpdateTest.Post,
+        primary_key?: true,
+        required?: true
     end
   end
 
@@ -127,13 +170,13 @@ defmodule Ash.Test.Actions.UpdateTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
+      read :read
+      create :create
+      update :update
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :title, :string
       attribute :contents, :string
     end
@@ -162,8 +205,6 @@ defmodule Ash.Test.Actions.UpdateTest do
     end
   end
 
-  import Ash.Changeset
-
   describe "simple updates" do
     test "allows updating a record with valid attributes" do
       post =
@@ -173,6 +214,70 @@ defmodule Ash.Test.Actions.UpdateTest do
 
       assert %Post{title: "bar", contents: "foo"} =
                post |> new(%{title: "bar", contents: "foo"}) |> Api.update!()
+    end
+  end
+
+  describe "manual updates" do
+    test "the update occurs properly" do
+      author =
+        Author
+        |> new(%{name: "auto"})
+        |> Api.create!()
+
+      assert %Author{name: "manual"} = author |> new() |> Api.update!(action: :manual_update)
+    end
+  end
+
+  describe "allow_nil?" do
+    test "it does not allow updating a value to `nil` when `allow_nil?: false`" do
+      profile =
+        Profile
+        |> new(%{bio: "foobar"})
+        |> Api.create!()
+
+      assert_raise Ash.Error.Invalid, ~r/attribute bio is required/, fn ->
+        profile |> new(%{bio: ""}) |> Api.update!()
+      end
+    end
+
+    test "it does not allow updating a private attribute's value to `nil` when `allow_nil?: false`" do
+      profile =
+        Profile
+        |> new(%{bio: "foobar"})
+        |> Api.create!()
+
+      assert_raise Ash.Error.Invalid, ~r/attribute non_nil_private is required/, fn ->
+        profile |> new(%{bio: "foobar"}) |> Api.update!(action: :set_private_attribute_to_nil)
+      end
+    end
+
+    test "it passes through an argument's value" do
+      profile =
+        Profile
+        |> new(%{bio: "foobar"})
+        |> Api.create!()
+
+      profile =
+        profile
+        |> new(%{bio: "foobar", private: "blah"})
+        |> Api.update!(action: :set_private_attribute_from_arg)
+
+      assert profile.private == "blah"
+    end
+  end
+
+  describe "select" do
+    test "allows selecting fields on the changeset" do
+      post =
+        Post
+        |> new(%{title: "foo", contents: "bar"})
+        |> Api.create!()
+
+      assert %Post{title: "bar", contents: nil} =
+               post
+               |> new(%{title: "bar", contents: "foo"})
+               |> Ash.Changeset.select(:title)
+               |> Api.update!()
     end
   end
 
@@ -194,7 +299,7 @@ defmodule Ash.Test.Actions.UpdateTest do
         |> new(%{name: "fred"})
         |> Api.create!()
 
-      assert_raise Ash.Error.Invalid, ~r/Invalid value provided for bio: Cannot be changed/, fn ->
+      assert_raise Ash.Error.Invalid, ~r/Invalid value provided for bio: cannot be changed/, fn ->
         author
         |> new(%{bio: "bio"})
         |> Api.update!(action: :only_allow_name)
@@ -239,6 +344,28 @@ defmodule Ash.Test.Actions.UpdateTest do
       |> new()
       |> replace_relationship(:related_posts, [post2, post3])
       |> Api.update!()
+    end
+
+    test "allows directly managing a many_to_many relationship" do
+      post =
+        Post
+        |> new(%{title: "title"})
+        |> manage_relationship(:related_posts, [%{title: "title0"}], type: :direct_control)
+        |> Api.create!()
+
+      other_post = Post |> Ash.Query.filter(title == "title0") |> Api.read_one!()
+
+      post
+      |> new()
+      |> manage_relationship(
+        :related_posts,
+        [%{title: "title3", id: other_post.id}, %{title: "title1"}],
+        type: :direct_control
+      )
+      |> Api.update!()
+
+      assert ["title", "title1", "title3"] =
+               Post |> Ash.Query.sort(:title) |> Api.read!() |> Enum.map(& &1.title)
     end
 
     test "it updates the join table properly" do
@@ -289,6 +416,7 @@ defmodule Ash.Test.Actions.UpdateTest do
                  Api.get!(Post, post2.id),
                  Api.get!(Post, post3.id)
                ])
+               |> clear_meta()
     end
 
     test "it updates any join fields" do
@@ -310,8 +438,12 @@ defmodule Ash.Test.Actions.UpdateTest do
       new_post =
         post
         |> new()
-        |> replace_relationship(:related_posts, [{post2, %{type: "a"}}, {post3, %{type: "b"}}])
+        |> replace_relationship(:related_posts, [
+          Ash.Resource.Info.set_metadata(post2, %{join_keys: %{type: "a"}}),
+          Ash.Resource.Info.set_metadata(post3, %{join_keys: %{type: "b"}})
+        ])
         |> Api.update!()
+        |> Api.load!(:related_posts_join_assoc)
 
       types = Enum.sort(Enum.map(new_post.related_posts_join_assoc, &Map.get(&1, :type)))
 
@@ -320,8 +452,17 @@ defmodule Ash.Test.Actions.UpdateTest do
       new_post =
         new_post
         |> new()
-        |> replace_relationship(:related_posts, [{post2, %{type: "c"}}, {post3, %{type: "d"}}])
+        |> replace_relationship(
+          :related_posts,
+          [
+            Ash.Resource.Info.set_metadata(post2, %{join_keys: %{type: "c"}}),
+            Ash.Resource.Info.set_metadata(post3, %{join_keys: %{type: "d"}})
+          ],
+          on_match: :update,
+          on_lookup: :relate
+        )
         |> Api.update!()
+        |> Api.load!(:related_posts_join_assoc)
 
       types = Enum.sort(Enum.map(new_post.related_posts_join_assoc, &Map.get(&1, :type)))
 
@@ -402,7 +543,11 @@ defmodule Ash.Test.Actions.UpdateTest do
         |> replace_relationship(:profile, profile2)
         |> Api.update!()
 
-      assert updated_author.profile == %{profile2 | author_id: author.id}
+      assert %{updated_author.profile | __metadata__: nil} == %{
+               profile2
+               | author_id: author.id,
+                 __metadata__: nil
+             }
     end
   end
 
@@ -480,7 +625,11 @@ defmodule Ash.Test.Actions.UpdateTest do
         |> replace_relationship(:posts, [post2])
         |> Api.update!()
 
-      assert updated_author.posts == [Api.get!(Post, post2.id)]
+      post = Api.get!(Post, post2.id)
+
+      assert Enum.map(updated_author.posts, &%{&1 | __metadata__: nil}) == [
+               %{post | __metadata__: nil}
+             ]
     end
   end
 
@@ -530,7 +679,11 @@ defmodule Ash.Test.Actions.UpdateTest do
       |> replace_relationship(:author, author2)
       |> Api.update!()
 
-      assert Api.get!(Author, author2.id, load: [:posts]).posts == [Api.get!(Post, post.id)]
+      author2 = Api.get!(Author, author2.id, load: :posts)
+
+      assert Enum.map(author2.posts, & &1.id) == [
+               post.id
+             ]
     end
 
     test "it responds with the relationship field filled in" do
@@ -552,8 +705,8 @@ defmodule Ash.Test.Actions.UpdateTest do
 
       updated_post = post |> new() |> replace_relationship(:author, author2) |> Api.update!()
 
-      assert updated_post.author ==
-               Api.get!(Author, author2.id)
+      assert updated_post.author.id ==
+               Api.get!(Author, author2.id).id
     end
   end
 
@@ -563,6 +716,8 @@ defmodule Ash.Test.Actions.UpdateTest do
         Authorized
         |> new(%{name: "bar"})
         |> Api.create!()
+
+      start_supervised({Ash.Test.Authorizer, check: :forbidden, strict_check: :continue})
 
       assert_raise(Ash.Error.Forbidden, fn ->
         record

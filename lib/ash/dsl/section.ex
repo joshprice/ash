@@ -25,59 +25,9 @@ defmodule Ash.Dsl.Section do
     imports: [],
     schema: [],
     describe: "",
+    examples: [],
+    modules: [],
     entities: [],
     sections: []
   ]
-
-  @type t :: %__MODULE__{
-          name: atom,
-          describe: String.t(),
-          entities: [Ash.Dsl.Entity.t()],
-          sections: [%__MODULE__{}],
-          schema: NimbleOptions.schema()
-        }
-
-  def describe(mod, section, depth \\ 2) do
-    options_doc =
-      if section.schema && section.schema != [] do
-        "\n" <> header("Options", depth) <> "\n" <> NimbleOptions.docs(section.schema)
-      else
-        ""
-      end
-
-    entity_doc =
-      case section.entities do
-        [] ->
-          ""
-
-        entities ->
-          "\n" <>
-            header("Constructors", depth) <>
-            Enum.map_join(entities, "\n", fn entity ->
-              nested_module_name = Module.concat(mod, Macro.camelize(to_string(entity.name)))
-
-              "* " <> to_string(entity.name) <> " - " <> "`#{inspect(nested_module_name)}`"
-            end)
-      end
-
-    section_doc =
-      case section.sections do
-        [] ->
-          ""
-
-        sections ->
-          "\n" <>
-            header("Sections", depth) <>
-            Enum.map_join(sections, "\n", fn section ->
-              nested_module_name = Module.concat(mod, Macro.camelize(to_string(section.name)))
-              "* " <> to_string(section.name) <> " - " <> "`#{inspect(nested_module_name)}`"
-            end)
-      end
-
-    section.describe <> options_doc <> entity_doc <> section_doc
-  end
-
-  defp header(header, depth) do
-    String.duplicate("#", depth) <> " " <> header <> "\n\n"
-  end
 end

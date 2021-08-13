@@ -2,7 +2,7 @@ defmodule Ash.Dsl.Extension do
   @moduledoc """
   An extension to the Ash DSL.
 
-  This allows configuring custom DSL components, whos configurations
+  This allows configuring custom DSL components, whose configurations
   can then be read back. This guide is still a work in progress, but should
   serve as a decent example of what is possible. Open issues on Github if you
   have any issues/something is unclear.
@@ -102,12 +102,19 @@ defmodule Ash.Dsl.Extension do
   See the documentation for `Ash.Dsl.Section` and `Ash.Dsl.Entity` for more information
   """
 
-  @callback sections() :: [Ash.Dsl.Section.t()]
+  @callback sections() :: [Ash.Dsl.section()]
   @callback transformers() :: [module]
 
   @doc "Get the entities configured for a given section"
   def get_entities(resource, path) do
+    Ash.Helpers.try_compile(resource)
     :persistent_term.get({resource, :ash, path}, %{entities: []}).entities
+  end
+
+  @doc "Get a value that was persisted while transforming or compiling the resource, e.g `:primary_key`"
+  def get_persisted(resource, key, default \\ nil) do
+    Ash.Helpers.try_compile(resource)
+    :persistent_term.get({resource, key}, default)
   end
 
   @doc """
@@ -124,6 +131,8 @@ defmodule Ash.Dsl.Extension do
           value
 
         _ ->
+          Ash.Helpers.try_compile(resource)
+
           Keyword.get(
             :persistent_term.get({resource, :ash, path}, %{opts: []}).opts,
             value,
@@ -131,12 +140,185 @@ defmodule Ash.Dsl.Extension do
           )
       end
     else
+      Ash.Helpers.try_compile(resource)
+
       Keyword.get(
         :persistent_term.get({resource, :ash, path}, %{opts: []}).opts,
         value,
         default
       )
     end
+  end
+
+  @doc """
+  Generate a table of contents for a list of sections
+  """
+  def doc_index(sections, depth \\ 0) do
+    sections
+    |> Enum.flat_map(fn
+      {_, entities} ->
+        entities
+
+      other ->
+        [other]
+    end)
+    |> Enum.map_join("\n", fn
+      section ->
+        docs =
+          if depth == 0 do
+            String.duplicate(" ", depth + 1) <>
+              "* [#{section.name}](#module-#{section.name})"
+          else
+            String.duplicate(" ", depth + 1) <> "* #{section.name}"
+          end
+
+        case List.wrap(section.entities) ++ List.wrap(Map.get(section, :sections)) do
+          [] ->
+            docs
+
+          sections_and_entities ->
+            docs <> "\n" <> doc_index(sections_and_entities, depth + 2)
+        end
+    end)
+  end
+
+  @doc """
+  Generate documentation for a list of sections
+  """
+  def doc(sections, depth \\ 1) do
+    Enum.map_join(sections, "\n\n", fn section ->
+      String.duplicate("#", depth + 1) <>
+        " " <>
+        to_string(section.name) <> "\n\n" <> doc_section(section, depth)
+    end)
+  end
+
+  defp doc_section(section, depth) do
+    sections_and_entities = List.wrap(section.entities) ++ List.wrap(section.sections)
+
+    table_of_contents =
+      case sections_and_entities do
+        [] ->
+          ""
+
+        sections_and_entities ->
+          doc_index(sections_and_entities)
+      end
+
+    options = Ash.OptionsHelpers.docs(section.schema)
+
+    examples =
+      case section.examples do
+        [] ->
+          ""
+
+        examples ->
+          "Examples:\n" <> Enum.map_join(examples, &doc_example/1)
+      end
+
+    entities =
+      Enum.map_join(section.entities, "\n\n", fn entity ->
+        String.duplicate("#", depth + 2) <>
+          " " <>
+          to_string(entity.name) <>
+          "\n\n" <>
+          doc_entity(entity, depth + 2)
+      end)
+
+    sections =
+      Enum.map_join(section.sections, "\n\n", fn section ->
+        String.duplicate("#", depth + 2) <>
+          " " <>
+          to_string(section.name) <>
+          "\n\n" <>
+          doc_section(section, depth + 1)
+      end)
+
+    imports =
+      case section.imports do
+        [] ->
+          ""
+
+        mods ->
+          "Imports:\n\n" <>
+            Enum.map_join(mods, "\n", fn mod ->
+              "* `#{inspect(mod)}`"
+            end)
+      end
+
+    """
+    #{section.describe}
+
+    #{table_of_contents}
+
+    #{examples}
+
+    #{imports}
+
+    ---
+
+    #{options}
+
+    #{entities}
+
+    #{sections}
+    """
+  end
+
+  defp doc_entity(entity, depth) do
+    options = Ash.OptionsHelpers.docs(Keyword.drop(entity.schema, entity.hide))
+
+    examples =
+      case entity.examples do
+        [] ->
+          ""
+
+        examples ->
+          "Examples:\n" <> Enum.map_join(examples, &doc_example/1)
+      end
+
+    entities =
+      Enum.flat_map(entity.entities, fn
+        {_, entities} ->
+          entities
+
+        other ->
+          [other]
+      end)
+
+    entities_doc =
+      Enum.map_join(entities, "\n\n", fn entity ->
+        String.duplicate("#", depth + 2) <>
+          " " <>
+          to_string(entity.name) <>
+          "\n\n" <>
+          doc_entity(entity, depth + 1)
+      end)
+
+    table_of_contents =
+      case entities do
+        [] ->
+          ""
+
+        entities ->
+          doc_index(entities)
+      end
+
+    """
+    #{entity.describe}
+
+    #{table_of_contents}
+
+    Introspection Target:
+
+    `#{inspect(entity.target)}`
+
+    #{examples}
+
+    #{options}
+
+    #{entities_doc}
+    """
   end
 
   def get_opt_config(resource, path, value) do
@@ -157,6 +339,23 @@ defmodule Ash.Dsl.Extension do
            end) do
       {:ok, value}
     end
+  end
+
+  defp doc_example({description, example}) when is_binary(description) and is_binary(example) do
+    """
+    #{description}
+    ```
+    #{example}
+    ```
+    """
+  end
+
+  defp doc_example(example) when is_binary(example) do
+    """
+    ```
+    #{example}
+    ```
+    """
   end
 
   @doc false
@@ -215,9 +414,16 @@ defmodule Ash.Dsl.Extension do
   end
 
   @doc false
-  defmacro set_state do
-    quote generated: true, location: :keep do
+  defmacro set_state(additional_persisted_data \\ []) do
+    quote generated: true,
+          location: :keep,
+          bind_quoted: [additional_persisted_data: additional_persisted_data] do
       alias Ash.Dsl.Transformer
+
+      persist =
+        additional_persisted_data
+        |> Keyword.put(:extensions, @extensions || [])
+        |> Enum.into(%{})
 
       ash_dsl_config =
         {__MODULE__, :ash_sections}
@@ -230,10 +436,19 @@ defmodule Ash.Dsl.Extension do
            )}
         end)
         |> Enum.into(%{})
-
-      :persistent_term.put({__MODULE__, :extensions}, @extensions)
+        |> Map.update(
+          :persist,
+          persist,
+          &Map.merge(&1, persist)
+        )
 
       Ash.Dsl.Extension.write_dsl_to_persistent_term(__MODULE__, ash_dsl_config)
+
+      for {key, _value} <- Process.get() do
+        if is_tuple(key) and elem(key, 0) == __MODULE__ do
+          Process.delete(key)
+        end
+      end
 
       transformers_to_run =
         @extensions
@@ -245,14 +460,11 @@ defmodule Ash.Dsl.Extension do
         transformers_to_run,
         ash_dsl_config
       )
-      |> Map.put_new(:persist, %{})
     end
   end
 
   defmacro load do
     quote do
-      :persistent_term.put({__MODULE__, :extensions}, @extensions)
-
       Ash.Dsl.Extension.write_dsl_to_persistent_term(
         __MODULE__,
         ash_dsl_config()
@@ -272,9 +484,7 @@ defmodule Ash.Dsl.Extension do
             if Exception.exception?(e) do
               reraise e, __STACKTRACE__
             else
-              reraise "Exception in transformer #{inspect(transformer)}: \n\n#{
-                        Exception.message(e)
-                      }",
+              reraise "Exception in transformer #{inspect(transformer)}: \n\n#{Exception.message(e)}",
                       __STACKTRACE__
             end
         end
@@ -302,7 +512,7 @@ defmodule Ash.Dsl.Extension do
     end)
 
     Enum.each(Map.get(dsl, :persist, %{}), fn {key, value} ->
-      :persistent_term.put(key, value)
+      :persistent_term.put({mod, key}, value)
     end)
 
     dsl
@@ -323,7 +533,7 @@ defmodule Ash.Dsl.Extension do
 
   def all_section_paths(sections, prior) do
     Enum.flat_map(sections, fn section ->
-      nested = all_section_paths(section.sections(), [section.name, prior])
+      nested = all_section_paths(section.sections, [section.name, prior])
 
       [Enum.reverse(prior) ++ [section.name] | nested]
     end)
@@ -337,7 +547,7 @@ defmodule Ash.Dsl.Extension do
 
   def all_section_config_paths(sections, prior) do
     Enum.flat_map(sections, fn section ->
-      nested = all_section_config_paths(section.sections(), [section.name, prior])
+      nested = all_section_config_paths(section.sections, [section.name, prior])
 
       fields =
         Enum.map(section.schema, fn {key, _} ->
@@ -362,24 +572,25 @@ defmodule Ash.Dsl.Extension do
       alias Ash.Dsl.Extension
 
       for section <- sections do
-        Extension.build_section(extension, section)
+        Extension.build_section(extension, section, true)
       end
     end
   end
 
   @doc false
-  defmacro build_section(extension, section, path \\ []) do
-    quote bind_quoted: [section: section, path: path, extension: extension] do
+  defmacro build_section(extension, section, doc?, path \\ []) do
+    quote bind_quoted: [section: section, path: path, extension: extension, doc?: doc?] do
       alias Ash.Dsl
 
       {section_modules, entity_modules, opts_module} =
         Dsl.Extension.do_build_section(__MODULE__, extension, section, path)
 
-      @doc Dsl.Section.describe(__MODULE__, section)
+      @doc false
 
       # This macro argument is only called `body` so that it looks nicer
       # in the DSL docs
 
+      @doc false
       defmacro unquote(section.name)(body) do
         opts_module = unquote(opts_module)
         section_path = unquote(path ++ [section.name])
@@ -464,7 +675,7 @@ defmodule Ash.Dsl.Extension do
                 )
 
               opts =
-                case NimbleOptions.validate(
+                case Ash.OptionsHelpers.validate(
                        current_config.opts,
                        Map.get(unquote(Macro.escape(section)), :schema, [])
                      ) do
@@ -473,6 +684,7 @@ defmodule Ash.Dsl.Extension do
 
                   {:error, error} ->
                     raise Ash.Error.Dsl.DslError,
+                      module: unquote(__MODULE__),
                       message: error,
                       path: unquote(section_path)
                 end
@@ -513,14 +725,15 @@ defmodule Ash.Dsl.Extension do
 
         {:module, module, _, _} =
           defmodule mod_name do
+            @moduledoc false
             alias Ash.Dsl
-            @moduledoc Dsl.Section.describe(__MODULE__, nested_section)
 
             require Dsl.Extension
 
             Dsl.Extension.build_section(
               extension,
               nested_section,
+              false,
               path ++ [section.name]
             )
           end
@@ -549,6 +762,13 @@ defmodule Ash.Dsl.Extension do
                 field = unquote(Macro.escape(field))
                 extension = unquote(extension)
                 section = unquote(Macro.escape(section))
+
+                value =
+                  if field in section.modules do
+                    Ash.Dsl.Extension.expand_alias(value, __CALLER__)
+                  else
+                    value
+                  end
 
                 quote do
                   current_sections = Process.get({__MODULE__, :ash_sections}, [])
@@ -611,7 +831,12 @@ defmodule Ash.Dsl.Extension do
         end)
       end)
 
-    Ash.Dsl.Extension.build_entity_options(options_mod_name, entity.schema, nested_entity_path)
+    Ash.Dsl.Extension.build_entity_options(
+      options_mod_name,
+      entity.schema,
+      entity.modules,
+      nested_entity_path
+    )
 
     args = Enum.map(entity.args, &Macro.var(&1, mod_name))
 
@@ -626,7 +851,7 @@ defmodule Ash.Dsl.Extension do
               nested_entity_mods: Macro.escape(nested_entity_mods),
               nested_entity_path: Macro.escape(nested_entity_path)
             ] do
-        @doc Ash.Dsl.Entity.describe(entity)
+        @moduledoc false
         defmacro unquote(entity.name)(unquote_splicing(args), opts \\ []) do
           section_path = unquote(Macro.escape(section_path))
           entity_schema = unquote(Macro.escape(entity.schema))
@@ -639,7 +864,25 @@ defmodule Ash.Dsl.Extension do
           nested_entity_mods = unquote(Macro.escape(nested_entity_mods))
           nested_entity_path = unquote(Macro.escape(nested_entity_path))
 
-          arg_values = unquote(args)
+          arg_values =
+            entity_args
+            |> Enum.zip(unquote(args))
+            |> Enum.map(fn {key, value} ->
+              if key in entity.modules do
+                Ash.Dsl.Extension.expand_alias(value, __CALLER__)
+              else
+                value
+              end
+            end)
+
+          opts =
+            Enum.map(opts, fn {key, value} ->
+              if key in entity.modules do
+                {key, Ash.Dsl.Extension.expand_alias(value, __CALLER__)}
+              else
+                {key, value}
+              end
+            end)
 
           quote do
             # This `try do` block scopes the imports/unimports properly
@@ -689,7 +932,6 @@ defmodule Ash.Dsl.Extension do
                     {__MODULE__, :ash, nested_path}
                     |> Process.get(%{entities: []})
                     |> Map.get(:entities, [])
-                    |> Enum.reverse()
 
                   Process.delete({__MODULE__, :ash, nested_path})
 
@@ -724,6 +966,7 @@ defmodule Ash.Dsl.Extension do
                       end
 
                     raise Ash.Error.Dsl.DslError,
+                      module: unquote(__MODULE__),
                       message: message,
                       path: section_path ++ additional_path
                 end
@@ -769,16 +1012,28 @@ defmodule Ash.Dsl.Extension do
   end
 
   @doc false
-  def build_entity_options(module_name, schema, nested_entity_path) do
+  def build_entity_options(module_name, schema, modules, nested_entity_path) do
     Module.create(
       module_name,
-      quote bind_quoted: [schema: Macro.escape(schema), nested_entity_path: nested_entity_path] do
+      quote bind_quoted: [
+              schema: Macro.escape(schema),
+              nested_entity_path: nested_entity_path,
+              modules: modules
+            ] do
         @moduledoc false
 
         for {key, _value} <- schema do
           defmacro unquote(key)(value) do
             key = unquote(key)
             nested_entity_path = unquote(nested_entity_path)
+            modules = unquote(modules)
+
+            value =
+              if key in modules do
+                Ash.Dsl.Extension.expand_alias(value, __CALLER__)
+              else
+                value
+              end
 
             quote do
               current_opts = Process.get({:builder_opts, unquote(nested_entity_path)}, [])
@@ -795,5 +1050,21 @@ defmodule Ash.Dsl.Extension do
     )
 
     module_name
+  end
+
+  def expand_alias(ast, env) do
+    Macro.postwalk(ast, fn
+      {first, {:__aliases__, _, _} = node} ->
+        {first, Macro.expand(node, %{env | function: {:ash_dsl_config, 0}})}
+
+      {{:__aliases__, _, _} = node, second} ->
+        {Macro.expand(node, %{env | function: {:ash_dsl_config, 0}}), second}
+
+      {:__aliases__, _, _} = node ->
+        Macro.expand(node, %{env | function: {:ash_dsl_config, 0}})
+
+      other ->
+        other
+    end)
   end
 end

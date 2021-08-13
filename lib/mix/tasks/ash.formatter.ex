@@ -1,5 +1,6 @@
 defmodule Mix.Tasks.Ash.Formatter do
-  @moduledoc "Generates a .formatter.exs from a list of extensions, and writes it."
+  @shortdoc "Generates a .formatter.exs from a list of extensions, and writes it."
+  @moduledoc @shortdoc
   use Mix.Task
 
   @formatter_exs_template """
@@ -17,7 +18,6 @@ defmodule Mix.Tasks.Ash.Formatter do
 
   """
 
-  @shortdoc @moduledoc
   @spec run(term) :: no_return
   def run(opts) do
     Mix.Task.run("compile")
@@ -78,7 +78,7 @@ defmodule Mix.Tasks.Ash.Formatter do
   end
 
   defp section_entity_builders(section) do
-    Enum.flat_map(section.entities, fn entity ->
+    Enum.flat_map(section.entities(), fn entity ->
       entity_builders(entity)
     end) ++ all_entity_builders(section.sections())
   end

@@ -17,21 +17,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - elixir: 1.8.2
-            otp: 22.3.4.8
-          - elixir: 1.9.4
-            otp: 22.3.4.8
-          - elixir: 1.10.4
-            otp: 22.3.4.8
-          - elixir: 1.10.4
+          - elixir: 1.12.0
             otp: 23.0.3
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - run: sudo apt-get install --yes erlang-dev
       - uses: actions/checkout@v2
-      - uses: actions/setup-elixir@v1
+      - uses: actions/setup-elixir@v1.5
         with:
+          experimental-otp: true
           otp-version: ${{matrix.otp}}
           elixir-version: ${{matrix.elixir}}
       - uses: actions/cache@v1
@@ -58,14 +53,15 @@ jobs:
     strategy:
       matrix:
         otp: ["23"]
-        elixir: ["1.10.0"]
+        elixir: ["1.11.0"]
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - run: sudo apt-get install --yes erlang-dev
       - uses: actions/checkout@v2
-      - uses: actions/setup-elixir@v1
+      - uses: actions/setup-elixir@v1.5
         with:
+          experimental-otp: true
           otp-version: ${{matrix.otp}}
           elixir-version: ${{matrix.elixir}}
       - uses: actions/cache@v1
@@ -84,14 +80,15 @@ jobs:
     strategy:
       matrix:
         otp: ["23"]
-        elixir: ["1.10.0"]
+        elixir: ["1.11.0"]
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - run: sudo apt-get install --yes erlang-dev
       - uses: actions/checkout@v2
-      - uses: actions/setup-elixir@v1
+      - uses: actions/setup-elixir@v1.5
         with:
+          experimental-otp: true
           otp-version: ${{matrix.otp}}
           elixir-version: ${{matrix.elixir}}
       - uses: actions/cache@v1
@@ -106,7 +103,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-      - uses: olegtarasov/get-tag@v2
+      - uses: little-core-labs/get-git-tag@v3.0.1
         id: tagName
       - uses: ethomson/send-tweet-action@v1
         if: startsWith(github.ref, 'refs/tags/v')
@@ -137,7 +134,7 @@ jobs:
             "ash_policy_authorizer",
           ]
         otp: ["23"]
-        elixir: ["1.10.4"]
+        elixir: ["1.11.0"]
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ASH_CI: true
@@ -153,8 +150,9 @@ jobs:
           repository: ash-project/${{matrix.project}}
           path: ${{matrix.project}}
           ref: master
-      - uses: actions/setup-elixir@v1
+      - uses: actions/setup-elixir@v1.5
         with:
+          experimental-otp: true
           otp-version: ${{matrix.otp}}
           elixir-version: ${{matrix.elixir}}
       - uses: actions/cache@v1

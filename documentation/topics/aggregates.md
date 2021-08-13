@@ -7,12 +7,12 @@ Aggregates in Ash allow for retrieving summary information over groups of relate
 Example:
 
 ```elixir
-aggreates do
+aggregates do
   count :count_of_posts, :posts, filter: [published: true]
 end
 ```
 
-See the documentation for the aggregates section in `Ash.Resource.Dsl.aggregates/1` for more information.
+See the documentation for the aggregates section in `Ash.Resource.Dsl` for more information.
 
 The aggregates declared on a resource allow for declaring a set of named aggregates that can be used by extensions.
 They can also be loaded in the query using `Ash.Query.load/2`, or after the fact using `c:Ash.Api.load/3`. Aggregates declared on the resource will be keys in the resource's struct.

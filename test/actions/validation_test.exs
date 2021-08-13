@@ -12,10 +12,10 @@ defmodule Ash.Test.Actions.ValidationTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
-      destroy :default
+      read :read
+      create :create
+      update :update
+      destroy :destroy
     end
 
     validations do
@@ -26,7 +26,7 @@ defmodule Ash.Test.Actions.ValidationTest do
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :bio, :string
       attribute :date, :date
       attribute :status, :string
@@ -78,7 +78,7 @@ defmodule Ash.Test.Actions.ValidationTest do
     end
 
     test "it fails if the value is not in the list" do
-      assert_raise(Ash.Error.Invalid, ~r/Expected value to be one of \["foo", "bar"\]/, fn ->
+      assert_raise(Ash.Error.Invalid, ~r/expected one of foo, bar/, fn ->
         Profile
         |> Ash.Changeset.new(%{status: "blart"})
         |> Api.create!()

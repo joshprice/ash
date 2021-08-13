@@ -34,6 +34,12 @@ defmodule Ash.Dsl.Transformer do
     Map.update(dsl, :persist, %{key => value}, &Map.put(&1, key, value))
   end
 
+  def get_persisted(dsl, key, default \\ nil) do
+    dsl
+    |> Map.get(:persist, %{})
+    |> Map.get(key, default)
+  end
+
   def build_entity(extension, path, name, opts) do
     do_build_entity(extension.sections(), path, name, opts)
   end
@@ -42,9 +48,12 @@ defmodule Ash.Dsl.Transformer do
     section = Enum.find(sections, &(&1.name == section_name))
     entity = Enum.find(section.entities, &(&1.name == name))
 
-    case NimbleOptions.validate(opts, entity.schema) do
-      {:ok, opts} -> {:ok, struct(entity.target, opts)}
-      {:error, error} -> {:error, error}
+    case Ash.OptionsHelpers.validate(opts, entity.schema) do
+      {:ok, opts} ->
+        {:ok, struct(entity.target, opts)}
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -54,10 +63,14 @@ defmodule Ash.Dsl.Transformer do
     do_build_entity(section.sections, rest, name, opts)
   end
 
-  def add_entity(dsl_state, path, entity) do
+  def add_entity(dsl_state, path, entity, opts \\ []) do
     Map.update(dsl_state, path, %{entities: [entity], opts: []}, fn config ->
       Map.update(config, :entities, [entity], fn entities ->
-        [entity | entities]
+        if (opts[:type] || :prepend) == :prepend do
+          [entity | entities]
+        else
+          entities ++ [entity]
+        end
       end)
     end)
   end

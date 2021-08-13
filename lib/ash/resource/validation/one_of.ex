@@ -1,8 +1,9 @@
 defmodule Ash.Resource.Validation.OneOf do
   @moduledoc false
-  alias Ash.Error.Changes.InvalidAttribute
 
-  @behaviour Ash.Resource.Validation
+  use Ash.Resource.Validation
+
+  alias Ash.Error.Changes.InvalidAttribute
 
   @opt_schema [
     values: [
@@ -21,7 +22,7 @@ defmodule Ash.Resource.Validation.OneOf do
 
   @impl true
   def init(opts) do
-    case NimbleOptions.validate(opts, @opt_schema) do
+    case Ash.OptionsHelpers.validate(opts, @opt_schema) do
       {:ok, opts} ->
         {:ok, opts}
 
@@ -32,19 +33,19 @@ defmodule Ash.Resource.Validation.OneOf do
 
   @impl true
   def validate(changeset, opts) do
-    case Ash.Changeset.fetch_change(changeset, opts[:attribute]) do
+    case Ash.Changeset.fetch_argument_or_change(changeset, opts[:attribute]) do
       {:ok, nil} ->
         :ok
 
       {:ok, changing_to} ->
-        if changing_to in opts[:values] do
+        if Enum.any?(opts[:values], &Comp.equal?(&1, changing_to)) do
           :ok
         else
           {:error,
            InvalidAttribute.exception(
              field: opts[:attribute],
-             validation: {:one_of, opts[:values]},
-             message: "Expected value to be one of #{inspect(opts[:values])}"
+             message: "expected one of %{values}",
+             vars: [values: Enum.map_join(opts[:values], ", ", &to_string/1)]
            )}
         end
 

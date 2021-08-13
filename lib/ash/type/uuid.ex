@@ -8,20 +8,38 @@ defmodule Ash.Type.UUID do
   use Ash.Type
 
   @impl true
-  def storage_type, do: :binary_id
+  def storage_type, do: Ecto.UUID
 
   @impl true
-  def cast_input(value) do
-    Ecto.Type.cast(:binary_id, value)
+  def cast_input(value, _) when is_binary(value) do
+    Ecto.Type.cast(Ecto.UUID, String.trim(value))
+  end
+
+  def cast_input(value, _) do
+    Ecto.Type.cast(Ecto.UUID, value)
   end
 
   @impl true
-  def cast_stored(value) do
-    Ecto.Type.load(:binary_id, value)
+  def cast_stored(value, constraints) do
+    case Ecto.Type.load(Ecto.UUID, value) do
+      :error ->
+        cast_input(value, constraints)
+
+      {:ok, value} ->
+        {:ok, value}
+    end
+  rescue
+    _e in ArgumentError ->
+      cast_input(value, constraints)
   end
 
   @impl true
-  def dump_to_native(value) do
-    Ecto.Type.dump(:binary_id, value)
+  def dump_to_embedded(value, constraints) do
+    cast_input(value, constraints)
+  end
+
+  @impl true
+  def dump_to_native(value, _) do
+    Ecto.Type.dump(Ecto.UUID, value)
   end
 end

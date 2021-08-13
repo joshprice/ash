@@ -1,11 +1,11 @@
 defmodule Ash.Error.Changes.InvalidChanges do
   @moduledoc "Used when a change is provided that covers multiple attributes/relationships"
-  use Ash.Error
+  use Ash.Error.Exception
 
   def_ash_error([:fields, :message, :validation], class: :invalid)
 
   defimpl Ash.ErrorKind do
-    def id(_), do: Ecto.UUID.generate()
+    def id(_), do: Ash.UUID.generate()
 
     def code(_), do: "invalid_attribute"
 
@@ -13,8 +13,9 @@ defmodule Ash.Error.Changes.InvalidChanges do
       "#{for_fields(error)}#{do_message(error)}"
     end
 
-    defp for_fields(%{fields: fields}) when not is_nil(fields),
-      do: "#{Enum.join(fields, ", ")}"
+    defp for_fields(%{fields: fields}) when not is_nil(fields) do
+      "#{Enum.join(fields, ", ")}"
+    end
 
     defp for_fields(_), do: ""
 

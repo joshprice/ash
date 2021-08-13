@@ -1,6 +1,6 @@
 defmodule Ash.Resource.Aggregate do
   @moduledoc "Represents a named aggregate on the resource that can be loaded"
-  defstruct [:name, :relationship_path, :filter, :kind, :description]
+  defstruct [:name, :relationship_path, :filter, :kind, :description, :private?, :field, :sort]
 
   @schema [
     name: [
@@ -14,27 +14,45 @@ defmodule Ash.Resource.Aggregate do
       required: true
     ],
     kind: [
-      type: {:one_of, Ash.Query.Aggregate.kinds()},
+      type: {:in, [:count, :first, :sum, :list]},
       doc: "The kind of the aggregate",
       required: true
     ],
+    field: [
+      type: :atom,
+      doc:
+        "The field to aggregate. Defaults to the first field in the primary key of the resource",
+      required: false
+    ],
     filter: [
-      type: :keyword_list,
+      type: :any,
       doc: "A filter to apply to the aggregate",
       default: []
+    ],
+    sort: [
+      type: :any,
+      doc: "A sort to be applied to the aggregate"
     ],
     description: [
       type: :string,
       doc: "An optional description for the aggregate"
+    ],
+    private?: [
+      type: :boolean,
+      default: false,
+      doc:
+        "Whether or not the aggregate will appear in any interfaces created off of this resource, e.g AshJsonApi and AshGraphql"
     ]
   ]
 
   @type t :: %__MODULE__{
           name: atom(),
-          relationship_path: {:ok, list(atom())} | {:error, String.t()},
+          relationship_path: list(atom()),
           filter: Keyword.t(),
-          kind: :count,
-          description: String.t() | nil
+          field: atom,
+          kind: :count | :first | :sum | :list,
+          description: String.t() | nil,
+          private?: boolean
         }
 
   @doc false

@@ -1,8 +1,8 @@
 defmodule Ash.Resource.Validation.Present do
   @moduledoc false
-  alias Ash.Error.Changes.{InvalidAttribute, InvalidChanges}
+  use Ash.Resource.Validation
 
-  @behaviour Ash.Resource.Validation
+  alias Ash.Error.Changes.{InvalidAttribute, InvalidChanges}
 
   @opt_schema [
     at_least: [
@@ -29,7 +29,7 @@ defmodule Ash.Resource.Validation.Present do
 
   @impl true
   def init(opts) do
-    case NimbleOptions.validate(opts, @opt_schema) do
+    case Ash.OptionsHelpers.validate(opts, @opt_schema) do
       {:ok, opts} ->
         {:ok, opts}
 
@@ -42,12 +42,17 @@ defmodule Ash.Resource.Validation.Present do
   def validate(changeset, opts) do
     {present, count} =
       Enum.reduce(opts[:attributes], {0, 0}, fn attribute, {present, count} ->
-        if is_nil(Ash.Changeset.get_attribute(changeset, attribute)) do
+        if is_nil(Ash.Changeset.get_argument_or_attribute(changeset, attribute)) do
           {present, count + 1}
         else
           {present + 1, count + 1}
         end
       end)
+
+    opts =
+      opts
+      |> Keyword.put(:keys, Enum.join(opts[:attributes] || [], ","))
+      |> Keyword.put(:fields, opts[:attributes])
 
     cond do
       opts[:exactly] && present != opts[:exactly] ->
@@ -57,7 +62,11 @@ defmodule Ash.Resource.Validation.Present do
           if count == 1 do
             attribute_error(opts, count, "must be present")
           else
-            attribute_error(opts, count, "exactly #{opts[:exactly]} must be present")
+            attribute_error(
+              opts,
+              count,
+              "exactly %{exactly} of %{keys} must be present"
+            )
           end
         end
 
@@ -65,14 +74,14 @@ defmodule Ash.Resource.Validation.Present do
         if count == 1 do
           attribute_error(opts, count, "must be present")
         else
-          changes_error(opts, count, "at least #{opts[:at_least]} must be present")
+          changes_error(opts, count, "at least %{at_least} of %{keys} must be present")
         end
 
       opts[:at_most] && present > opts[:at_most] ->
         if count == 1 do
           attribute_error(opts, count, "must not be present")
         else
-          changes_error(opts, count, "at least #{opts[:at_least]} must be present")
+          changes_error(opts, count, "at least %{at_most} of %{keys} must be present")
         end
 
       true ->
@@ -80,22 +89,26 @@ defmodule Ash.Resource.Validation.Present do
     end
   end
 
-  defp changes_error(opts, count, message) do
+  defp changes_error(opts, _count, message) do
     {:error,
      InvalidChanges.exception(
        fields: opts[:attributes],
-       validation: {:present, opts[:at_least] || count, opts[:at_most] || count},
-       message: message
+       message: message,
+       vars: opts
      )}
   end
 
-  defp attribute_error(opts, count, message) do
+  defp attribute_error(opts, _count, message) do
     {:error,
-     InvalidAttribute.exception(
-       field: List.first(opts[:attributes]),
-       validation: {:present, opts[:at_least] || count, opts[:at_most] || count},
-       message: message
-     )}
+     opts[:attributes]
+     |> List.wrap()
+     |> Enum.map(fn attribute ->
+       InvalidAttribute.exception(
+         field: attribute,
+         message: message,
+         vars: opts
+       )
+     end)}
   end
 
   @doc false

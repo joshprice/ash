@@ -7,10 +7,13 @@ defmodule Ash.Resource.Attribute do
     :allow_nil?,
     :generated?,
     :primary_key?,
+    :private?,
     :writable?,
+    :always_select?,
     :default,
     :update_default,
     :description,
+    sensitive?: false,
     constraints: []
   ]
 
@@ -19,9 +22,11 @@ defmodule Ash.Resource.Attribute do
           constraints: Keyword.t(),
           type: Ash.Type.t(),
           primary_key?: boolean(),
+          private?: boolean(),
           default: (() -> term),
-          update_default: (() -> term) | (Ash.record() -> term),
-          writable?: boolean
+          update_default: (() -> term) | (Ash.Resource.record() -> term),
+          sensitive?: boolean(),
+          writable?: boolean()
         }
 
   alias Ash.OptionsHelpers
@@ -32,7 +37,7 @@ defmodule Ash.Resource.Attribute do
       doc: "The name of the attribute."
     ],
     type: [
-      type: {:custom, OptionsHelpers, :ash_type, []},
+      type: :any,
       doc: "The type of the attribute."
     ],
     constraints: [
@@ -40,16 +45,53 @@ defmodule Ash.Resource.Attribute do
       doc:
         "Constraints to provide to the type when casting the value. See the type's documentation for more information."
     ],
+    sensitive?: [
+      type: :boolean,
+      default: false,
+      doc:
+        "Whether or not the attribute value contains sensitive information, like PII. If so, it will be redacted while inspecting data."
+    ],
+    always_select?: [
+      type: :boolean,
+      default: false,
+      doc: """
+      Whether or not to always select this attribute when reading from the database.
+      Useful if fields are used in read action preparations consistently.
+
+      A primary key attribute *cannot be deselected*, so this option will have no effect.
+
+      Generally, you should favor selecting the field that you need while running your preparation. For example:
+
+      ```elixir
+      defmodule MyApp.QueryPreparation.Thing do
+        use Ash.Resource.Preparation
+
+        def prepare(query, _, _) do
+          query
+          |> Ash.Query.select(:attribute_i_need)
+          |> Ash.Query.after_action(fn query, results ->
+            {:ok, Enum.map(results, fn result ->
+              do_something_with_attribute_i_need(result)
+            end)}
+          end)
+        end
+      end
+      ```
+
+      This will prevent unnecessary fields from being selected.
+      """
+    ],
     primary_key?: [
       type: :boolean,
       default: false,
       doc:
-        "Whether or not the attribute is part of the primary key (one or more fields that uniquely identify a resource)"
+        "Whether or not the attribute is part of the primary key (one or more fields that uniquely identify a resource). " <>
+          "If primary_key? is true, allow_nil? must be false."
     ],
     allow_nil?: [
       type: :boolean,
       default: true,
-      doc: "Whether or not the attribute can be set to nil"
+      doc: "Whether or not the attribute can be set to nil."
     ],
     generated?: [
       type: :boolean,
@@ -60,81 +102,66 @@ defmodule Ash.Resource.Attribute do
     writable?: [
       type: :boolean,
       default: true,
-      doc: "Whether or not the value can be written to"
+      doc: "Whether or not the value can be written to."
+    ],
+    private?: [
+      type: :boolean,
+      default: false,
+      doc:
+        "Whether or not the attribute will appear in any interfaces created off of this resource, e.g AshJsonApi and AshGraphql."
     ],
     update_default: [
       type: {:custom, Ash.OptionsHelpers, :default, []},
       doc:
-        "A zero argument function, an {mod, fun, args} triple or a value. If no value is provided for the attribute on update, this value is used."
+        "A zero argument function, an {mod, fun, args} triple or a value. `Ash.Changeset.for_update/4` sets the default in the changeset if a value is not provided."
     ],
     default: [
       type: {:custom, Ash.OptionsHelpers, :default, []},
       doc:
-        "A zero argument function, an {mod, fun, args} triple or a value. If no value is provided for the attribute on create, this value is used."
+        "A zero argument function, an {mod, fun, args} triple or a value. `Ash.Changeset.for_create/4` sets the default in the changeset if a value is not provided."
     ],
     description: [
       type: :string,
-      doc: "An optional description for the attribute"
+      doc: "An optional description for the attribute."
     ]
   ]
 
   @create_timestamp_schema @schema
                            |> OptionsHelpers.set_default!(:writable?, false)
+                           |> OptionsHelpers.set_default!(:private?, true)
                            |> OptionsHelpers.set_default!(:default, &DateTime.utc_now/0)
-                           |> OptionsHelpers.set_default!(:type, :utc_datetime)
+                           |> OptionsHelpers.set_default!(:type, Ash.Type.UtcDatetimeUsec)
+                           |> OptionsHelpers.set_default!(:allow_nil?, false)
 
   @update_timestamp_schema @schema
                            |> OptionsHelpers.set_default!(:writable?, false)
+                           |> OptionsHelpers.set_default!(:private?, true)
                            |> OptionsHelpers.set_default!(:default, &DateTime.utc_now/0)
-                           |> OptionsHelpers.set_default!(:update_default, &DateTime.utc_now/0)
-                           |> OptionsHelpers.set_default!(:type, :utc_datetime)
+                           |> OptionsHelpers.set_default!(
+                             :update_default,
+                             &DateTime.utc_now/0
+                           )
+                           |> OptionsHelpers.set_default!(:type, Ash.Type.UtcDatetimeUsec)
+                           |> OptionsHelpers.set_default!(:allow_nil?, false)
 
-  def transform(%{constraints: []} = attribute), do: {:ok, attribute}
+  @uuid_primary_key_schema @schema
+                           |> OptionsHelpers.set_default!(:writable?, false)
+                           |> OptionsHelpers.set_default!(:default, &Ash.UUID.generate/0)
+                           |> OptionsHelpers.set_default!(:primary_key?, true)
+                           |> OptionsHelpers.set_default!(:type, Ash.Type.UUID)
+                           |> Keyword.delete(:allow_nil?)
 
-  def transform(%{constraints: constraints, type: type} = attribute) do
-    case type do
-      {:array, type} ->
-        with {:ok, new_constraints} <-
-               NimbleOptions.validate(
-                 Keyword.delete(constraints, :items),
-                 Ash.Type.list_constraints()
-               ),
-             {:ok, item_constraints} <- validate_item_constraints(type, constraints) do
-          {:ok,
-           %{attribute | constraints: Keyword.put(new_constraints, :items, item_constraints)}}
-        end
-
-      type ->
-        schema = Ash.Type.constraints(type)
-
-        case NimbleOptions.validate(constraints, schema) do
-          {:ok, constraints} ->
-            {:ok, %{attribute | constraints: constraints}}
-
-          {:error, error} ->
-            {:error, error}
-        end
-    end
-  end
-
-  defp validate_item_constraints(type, constraints) do
-    if Keyword.has_key?(constraints, :items) do
-      schema = Ash.Type.constraints(type)
-
-      case NimbleOptions.validate(constraints[:items], schema) do
-        {:ok, item_constraints} ->
-          {:ok, item_constraints}
-
-        {:error, error} ->
-          {:error, error}
-      end
-    else
-      {:ok, constraints}
-    end
-  end
+  @integer_primary_key_schema @schema
+                              |> OptionsHelpers.set_default!(:writable?, false)
+                              |> OptionsHelpers.set_default!(:primary_key?, true)
+                              |> OptionsHelpers.set_default!(:generated?, true)
+                              |> OptionsHelpers.set_default!(:type, Ash.Type.Integer)
+                              |> Keyword.delete(:allow_nil?)
 
   @doc false
   def attribute_schema, do: @schema
   def create_timestamp_schema, do: @create_timestamp_schema
   def update_timestamp_schema, do: @update_timestamp_schema
+  def uuid_primary_key_schema, do: @uuid_primary_key_schema
+  def integer_primary_key_schema, do: @integer_primary_key_schema
 end

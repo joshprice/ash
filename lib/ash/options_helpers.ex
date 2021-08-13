@@ -1,5 +1,10 @@
 defmodule Ash.OptionsHelpers do
-  @moduledoc false
+  @moduledoc """
+  Helpers for working with nimble options
+  """
+
+  @type schema :: NimbleOptions.schema()
+
   def merge_schemas(left, right, section \\ nil) do
     new_right =
       Enum.map(right, fn {key, value} ->
@@ -9,18 +14,47 @@ defmodule Ash.OptionsHelpers do
     Keyword.merge(left, new_right)
   end
 
+  def validate(opts, schema) do
+    NimbleOptions.validate(opts, sanitize_schema(schema))
+  end
+
+  def validate!(opts, schema) do
+    NimbleOptions.validate!(opts, sanitize_schema(schema))
+  end
+
+  def docs(schema) do
+    schema
+    |> Enum.reject(fn {_key, opts} ->
+      opts[:hide]
+    end)
+    |> sanitize_schema()
+    |> Enum.map(fn {key, opts} ->
+      if opts[:doc] do
+        {key, Keyword.update!(opts, :doc, &String.replace(&1, "\n\n", "  \n"))}
+      else
+        {key, opts}
+      end
+    end)
+    |> NimbleOptions.docs()
+  end
+
+  defp sanitize_schema(schema) do
+    Enum.map(schema, fn {key, opts} ->
+      new_opts =
+        case opts[:type] do
+          {:one_of, values} ->
+            Keyword.put(opts, :type, {:in, values})
+
+          _ ->
+            opts
+        end
+
+      {key, Keyword.drop(new_opts, [:hide, :as])}
+    end)
+  end
+
   def map(value) when is_map(value), do: {:ok, value}
   def map(_), do: {:error, "must be a map"}
-
-  def ash_type(type) do
-    type = Ash.Type.get_type(type)
-
-    if Ash.Type.ash_type?(type) do
-      {:ok, type}
-    else
-      {:error, "Attribute type must be a built in type or a type module, got: #{inspect(type)}"}
-    end
-  end
 
   def list_of_atoms(value) do
     if is_list(value) and Enum.all?(value, &is_atom/1) do

@@ -10,9 +10,32 @@ defmodule Ash.DataLayer.Mnesia do
   in place. This is primarily used for testing the behavior of data layers in Ash. If it was improved,
   it could be a viable data layer.
   """
+  @behaviour Ash.DataLayer
+
+  @mnesia %Ash.Dsl.Section{
+    name: :mnesia,
+    describe: """
+    A section for configuring the mnesia data layer
+    """,
+    examples: [
+      """
+      mnesia do
+        table :custom_table
+      end
+      """
+    ],
+    schema: [
+      table: [
+        type: :atom,
+        doc: "The table name to use, defaults to the name of the resource"
+      ]
+    ]
+  }
+
+  use Ash.Dsl.Extension, sections: [@mnesia]
 
   alias Ash.Actions.Sort
-  alias Ash.DataLayer.Ets
+  alias Ash.Dsl.Extension
   alias :mnesia, as: Mnesia
 
   def start(api) do
@@ -24,9 +47,10 @@ defmodule Ash.DataLayer.Mnesia do
     api
     |> Ash.Api.resources()
     |> Enum.each(fn resource ->
-      attributes = resource |> Ash.Resource.attributes() |> Enum.map(& &1.name) |> Enum.sort()
+      attributes =
+        resource |> Ash.Resource.Info.attributes() |> Enum.map(& &1.name) |> Enum.sort()
 
-      case Ash.Resource.primary_key(resource) do
+      case Ash.Resource.Info.primary_key(resource) do
         [] ->
           resource
           |> table()
@@ -40,34 +64,13 @@ defmodule Ash.DataLayer.Mnesia do
     end)
   end
 
-  alias Ash.Filter.Predicate.{Eq, GreaterThan, In, IsNil, LessThan}
-
-  @behaviour Ash.DataLayer
-
-  @mnesia %Ash.Dsl.Section{
-    name: :mnesia,
-    describe: """
-    A section for configuring the mnesia data layer
-    """,
-    schema: [
-      table: [
-        type: :atom,
-        doc: "The table name to use, defaults to the name of the resource"
-      ]
-    ]
-  }
-
-  use Ash.Dsl.Extension, sections: [@mnesia]
-
-  alias Ash.Dsl.Extension
-
   def table(resource) do
     Extension.get_opt(resource, [:ets], :private?, resource, true)
   end
 
   defmodule Query do
     @moduledoc false
-    defstruct [:resource, :filter, :limit, :sort, relationships: %{}, offset: 0]
+    defstruct [:api, :resource, :filter, :limit, :sort, relationships: %{}, offset: 0]
   end
 
   @impl true
@@ -84,18 +87,26 @@ defmodule Ash.DataLayer.Mnesia do
   def can?(_, :offset), do: true
   def can?(_, :boolean_filter), do: true
   def can?(_, :transact), do: true
-  def can?(_, {:filter_predicate, _, %In{}}), do: true
-  def can?(_, {:filter_predicate, _, %Eq{}}), do: true
-  def can?(_, {:filter_predicate, _, %IsNil{}}), do: true
-  def can?(_, {:filter_predicate, _, %LessThan{}}), do: true
-  def can?(_, {:filter_predicate, _, %GreaterThan{}}), do: true
+
+  def can?(_, {:join, resource}) do
+    # This is to ensure that these can't join, which is necessary for testing
+    # if someone needs to use these both and *actually* needs real joins for private
+    # ets resources then we can talk about making this only happen in ash tests
+    not (Ash.DataLayer.data_layer(resource) == Ash.DataLayer.Ets &&
+           Ash.DataLayer.Ets.private?(resource))
+  end
+
+  def can?(_, {:filter_expr, _}), do: true
+  def can?(_, :nested_expressions), do: true
   def can?(_, {:sort, _}), do: true
+
   def can?(_, _), do: false
 
   @impl true
-  def resource_to_query(resource) do
+  def resource_to_query(resource, api) do
     %Query{
-      resource: resource
+      resource: resource,
+      api: api
     }
   end
 
@@ -120,7 +131,14 @@ defmodule Ash.DataLayer.Mnesia do
 
   @impl true
   def run_query(
-        %Query{resource: resource, filter: filter, offset: offset, limit: limit, sort: sort},
+        %Query{
+          api: api,
+          resource: resource,
+          filter: filter,
+          offset: offset,
+          limit: limit,
+          sort: sort
+        },
         _resource
       ) do
     records =
@@ -133,10 +151,11 @@ defmodule Ash.DataLayer.Mnesia do
         {:error, reason}
 
       {:atomic, records} ->
-        attributes = resource |> Ash.Resource.attributes() |> Enum.map(& &1.name) |> Enum.sort()
+        attributes =
+          resource |> Ash.Resource.Info.attributes() |> Enum.map(& &1.name) |> Enum.sort()
 
         elements_to_drop =
-          case Ash.Resource.primary_key(resource) do
+          case Ash.Resource.Info.primary_key(resource) do
             [] ->
               1
 
@@ -152,40 +171,44 @@ defmodule Ash.DataLayer.Mnesia do
             )
           end)
 
-        offset_records =
-          structified_records
-          |> Ets.filter_matches(filter)
-          |> Sort.runtime_sort(sort)
-          |> Enum.drop(offset || 0)
+        api
+        |> Ash.Filter.Runtime.filter_matches(structified_records, filter)
+        |> case do
+          {:ok, filtered} ->
+            offset_records =
+              filtered
+              |> Sort.runtime_sort(sort)
+              |> Enum.drop(offset || 0)
 
-        limited_records =
-          if limit do
-            Enum.take(offset_records, limit)
-          else
-            offset_records
-          end
+            limited_records =
+              if limit do
+                Enum.take(offset_records, limit)
+              else
+                offset_records
+              end
 
-        {:ok, limited_records}
+            {:ok, limited_records}
+
+          {:error, error} ->
+            {:error, error}
+        end
     end
-  rescue
-    error ->
-      {:error, error}
   end
 
   @impl true
   def create(resource, changeset) do
-    record = Ash.Changeset.apply_attributes(changeset)
+    {:ok, record} = Ash.Changeset.apply_attributes(changeset)
 
     pkey =
       resource
-      |> Ash.Resource.primary_key()
+      |> Ash.Resource.Info.primary_key()
       |> Enum.map(fn attr ->
         Map.get(record, attr)
       end)
 
     values =
       resource
-      |> Ash.Resource.attributes()
+      |> Ash.Resource.Info.attributes()
       |> Enum.sort_by(& &1.name)
       |> Enum.map(&Map.get(record, &1.name))
 
@@ -207,16 +230,13 @@ defmodule Ash.DataLayer.Mnesia do
       {:atomic, _} -> {:ok, record}
       {:aborted, error} -> {:error, error}
     end
-  rescue
-    error ->
-      {:error, error}
   end
 
   @impl true
   def destroy(resource, %{data: record}) do
     pkey =
       resource
-      |> Ash.Resource.primary_key()
+      |> Ash.Resource.Info.primary_key()
       |> Enum.map(&Map.get(record, &1))
 
     result =
@@ -228,9 +248,6 @@ defmodule Ash.DataLayer.Mnesia do
       {:atomic, _} -> :ok
       {:aborted, error} -> {:error, error}
     end
-  rescue
-    error ->
-      {:error, error}
   end
 
   @impl true
@@ -239,7 +256,7 @@ defmodule Ash.DataLayer.Mnesia do
   end
 
   @impl true
-  def upsert(resource, changeset) do
+  def upsert(resource, changeset, _) do
     create(resource, changeset)
   end
 

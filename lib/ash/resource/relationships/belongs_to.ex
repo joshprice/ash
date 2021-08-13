@@ -8,11 +8,19 @@ defmodule Ash.Resource.Relationships.BelongsTo do
     :define_field?,
     :field_type,
     :destination_field,
+    :private?,
     :source_field,
     :source,
+    :read_action,
+    :not_found_message,
+    :violation_message,
     :required?,
+    :filter,
+    :sort,
     :writable?,
+    :context,
     :description,
+    validate_destination_field?: true,
     cardinality: :one,
     type: :belongs_to
   ]
@@ -22,13 +30,16 @@ defmodule Ash.Resource.Relationships.BelongsTo do
           cardinality: :one,
           writable?: boolean,
           name: atom,
-          source: Ash.resource(),
-          destination: Ash.resource(),
+          read_action: atom,
+          filter: Ash.Filter.t(),
+          source: Ash.Resource.t(),
+          destination: Ash.Resource.t(),
           required?: boolean,
           primary_key?: boolean,
           define_field?: boolean,
-          field_type: Ash.Type.t(),
+          field_type: term,
           destination_field: atom,
+          private?: boolean,
           source_field: atom | nil,
           description: String.t()
         }
@@ -61,7 +72,7 @@ defmodule Ash.Resource.Relationships.BelongsTo do
                       "If set to `false` a field is not created on the resource for this relationship, and one must be manually added in `attributes`."
                   ],
                   field_type: [
-                    type: {:custom, OptionsHelpers, :ash_type, []},
+                    type: :any,
                     default: :uuid,
                     doc: "The field type of the automatically created field."
                   ]

@@ -10,7 +10,7 @@ defmodule Ash.Test.Dsl.Resource.Actions.CreateTest do
           data_layer: Ash.DataLayer.Ets
 
         attributes do
-          attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+          uuid_primary_key :id
         end
 
         unquote(body)
@@ -22,17 +22,18 @@ defmodule Ash.Test.Dsl.Resource.Actions.CreateTest do
     test "it creates an action" do
       defposts do
         actions do
-          create :default
+          defaults []
+          create :create
         end
       end
 
       assert [
                %Ash.Resource.Actions.Create{
-                 name: :default,
+                 name: :create,
                  primary?: true,
                  type: :create
                }
-             ] = Ash.Resource.actions(Post)
+             ] = Ash.Resource.Info.actions(Post)
     end
   end
 
@@ -40,7 +41,7 @@ defmodule Ash.Test.Dsl.Resource.Actions.CreateTest do
     test "it fails if `name` is not an atom" do
       assert_raise(
         Ash.Error.Dsl.DslError,
-        "actions -> create -> default:\n  expected :name to be an atom, got: \"default\"",
+        "[Ash.Resource.Dsl.Create]\n actions -> create -> default:\n  expected :name to be an atom, got: \"default\"",
         fn ->
           defposts do
             actions do
@@ -54,11 +55,11 @@ defmodule Ash.Test.Dsl.Resource.Actions.CreateTest do
     test "it fails if `primary?` is not a boolean" do
       assert_raise(
         Ash.Error.Dsl.DslError,
-        "actions -> create -> default:\n  expected :primary? to be an boolean, got: 10",
+        "[Ash.Resource.Dsl.Create]\n actions -> create -> create:\n  expected :primary? to be a boolean, got: 10",
         fn ->
           defposts do
             actions do
-              create :default, primary?: 10
+              create :create, primary?: 10
             end
           end
         end

@@ -9,7 +9,7 @@ defmodule Ash.Test.Resource.IdentitiesTest do
         use Ash.Resource
 
         attributes do
-          attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+          uuid_primary_key :id
 
           attribute :name, :string
           attribute :contents, :string
@@ -23,29 +23,25 @@ defmodule Ash.Test.Resource.IdentitiesTest do
   describe "representation" do
     test "identities are persisted on the resource properly" do
       defposts do
-        resource do
-          identities do
-            identity :foobar, [:name, :contents]
-          end
+        identities do
+          identity :foobar, [:name, :contents]
         end
       end
 
       assert [%Ash.Resource.Identity{name: :foobar, keys: [:name, :contents]}] =
-               Ash.Resource.identities(Post)
+               Ash.Resource.Info.identities(Post)
     end
 
     test "Identity descriptions are allowed" do
       defposts do
-        resource do
-          identities do
-            identity :foobar, [:name, :contents], description: "require one of name/contents"
-          end
+        identities do
+          identity :foobar, [:name, :contents], description: "require one of name/contents"
         end
       end
 
       assert [
                %Ash.Resource.Identity{description: "require one of name/contents"}
-             ] = Ash.Resource.identities(Post)
+             ] = Ash.Resource.Info.identities(Post)
     end
   end
 end

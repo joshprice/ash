@@ -1,9 +1,12 @@
 defmodule Ash.DataLayer.EtsTest do
   use ExUnit.Case, async: false
 
+  import Ash.Test.Helpers
+
   alias Ash.DataLayer.Ets, as: EtsDataLayer
   alias Ash.DataLayer.Ets.Query
-  alias Ash.Filter.Predicate.{Eq, GreaterThan, In, LessThan}
+
+  require Ash.Query
 
   setup do
     on_exit(fn ->
@@ -22,14 +25,14 @@ defmodule Ash.DataLayer.EtsTest do
     end
 
     actions do
-      read(:default)
-      create(:default)
-      update(:default)
-      destroy(:default)
+      read(:read)
+      create(:create)
+      update(:update)
+      destroy(:destroy)
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id, writable?: true
       attribute :name, :string
       attribute :age, :integer
       attribute :title, :string
@@ -44,39 +47,16 @@ defmodule Ash.DataLayer.EtsTest do
     end
   end
 
-  test "can?" do
-    assert EtsDataLayer.can?(EtsTestUser, :async_engine) == false
-    assert EtsDataLayer.can?(EtsTestUser, :composite_primary_key) == true
-    assert EtsDataLayer.can?(EtsTestUser, :upsert) == true
-    assert EtsDataLayer.can?(EtsTestUser, :boolean_filter) == true
-    assert EtsDataLayer.can?(EtsTestUser, :transact) == false
-    assert EtsDataLayer.can?(EtsTestUser, :create) == true
-    assert EtsDataLayer.can?(EtsTestUser, :read) == true
-    assert EtsDataLayer.can?(EtsTestUser, :update) == true
-    assert EtsDataLayer.can?(EtsTestUser, :destroy) == true
-    assert EtsDataLayer.can?(EtsTestUser, :sort) == true
-    assert EtsDataLayer.can?(EtsTestUser, :filter) == true
-    assert EtsDataLayer.can?(EtsTestUser, :limit) == true
-    assert EtsDataLayer.can?(EtsTestUser, :offset) == true
-    assert EtsDataLayer.can?(EtsTestUser, {:filter_predicate, :foo, %In{}}) == true
-    assert EtsDataLayer.can?(EtsTestUser, {:filter_predicate, :foo, %Eq{}}) == true
-    assert EtsDataLayer.can?(EtsTestUser, {:filter_predicate, :foo, %LessThan{}}) == true
-    assert EtsDataLayer.can?(EtsTestUser, {:filter_predicate, :foo, %GreaterThan{}}) == true
-    assert EtsDataLayer.can?(EtsTestUser, {:sort, :foo}) == true
-    assert EtsDataLayer.can?(EtsTestUser, :foo) == false
-  end
-
   test "resource_to_query" do
-    assert %Query{resource: EtsTestUser} = EtsDataLayer.resource_to_query(EtsTestUser)
+    assert %Query{resource: EtsTestUser} = EtsDataLayer.resource_to_query(EtsTestUser, nil)
   end
 
-  test "limit, offset, filter, sortm, aggregate" do
-    query = EtsDataLayer.resource_to_query(EtsTestUser)
+  test "limit, offset, filter, sort" do
+    query = EtsDataLayer.resource_to_query(EtsTestUser, nil)
     assert {:ok, %Query{limit: 3}} = EtsDataLayer.limit(query, 3, :foo)
     assert {:ok, %Query{offset: 10}} = EtsDataLayer.offset(query, 10, :foo)
     assert {:ok, %Query{filter: :all}} = EtsDataLayer.filter(query, :all, :foo)
     assert {:ok, %Query{sort: :asc}} = EtsDataLayer.sort(query, :asc, :foo)
-    assert {:ok, %Query{aggregates: [:foo]}} = EtsDataLayer.add_aggregate(query, :foo, :bar)
   end
 
   test "create" do
@@ -138,7 +118,7 @@ defmodule Ash.DataLayer.EtsTest do
       |> Ash.Query.new()
       |> Ash.Query.sort(:name)
 
-    assert [^joe, ^matthew, ^mike, ^zachary] = EtsApiTest.read!(query)
+    assert [^joe, ^matthew, ^mike, ^zachary] = clear_meta(EtsApiTest.read!(query))
   end
 
   test "limit" do
@@ -153,7 +133,7 @@ defmodule Ash.DataLayer.EtsTest do
       |> Ash.Query.sort(:name)
       |> Ash.Query.limit(2)
 
-    assert [^joe, ^matthew] = EtsApiTest.read!(query)
+    assert [^joe, ^matthew] = clear_meta(EtsApiTest.read!(query))
   end
 
   test "offset" do
@@ -168,7 +148,7 @@ defmodule Ash.DataLayer.EtsTest do
       |> Ash.Query.sort(:name)
       |> Ash.Query.offset(1)
 
-    assert [^matthew, ^mike, ^zachary] = EtsApiTest.read!(query)
+    assert [^matthew, ^mike, ^zachary] = clear_meta(EtsApiTest.read!(query))
   end
 
   describe "filter" do
@@ -181,56 +161,61 @@ defmodule Ash.DataLayer.EtsTest do
     end
 
     test "values", %{zachary: zachary, matthew: matthew, joe: joe} do
-      assert [^zachary] = filter_users(name: "Zachary")
-      assert [^joe] = filter_users(name: "Joe")
-      assert [^matthew] = filter_users(age: 9)
+      assert [^zachary] = clear_meta(filter_users(name: "Zachary"))
+      assert [^joe] = clear_meta(filter_users(name: "Joe"))
+      assert [^matthew] = clear_meta(filter_users(age: 9))
     end
 
     test "or, in, eq", %{mike: mike, zachary: zachary, joe: joe} do
       assert [^joe, ^mike, ^zachary] =
-               filter_users(
-                 or: [
-                   [name: [in: ["Zachary", "Mike"]]],
-                   [age: [eq: 11]]
-                 ]
+               clear_meta(
+                 filter_users(
+                   or: [
+                     [name: [in: ["Zachary", "Mike"]]],
+                     [age: [eq: 11]]
+                   ]
+                 )
                )
     end
 
     test "and, in, eq", %{mike: mike} do
       assert [^mike] =
-               filter_users(
-                 and: [
-                   [name: [in: ["Zachary", "Mike"]]],
-                   [age: [eq: 37]]
-                 ]
+               clear_meta(
+                 filter_users(
+                   and: [
+                     [name: [in: ["Zachary", "Mike"]]],
+                     [age: [eq: 37]]
+                   ]
+                 )
                )
     end
 
     test "and, in, not", %{zachary: zachary} do
       assert [^zachary] =
-               filter_users(
-                 and: [
-                   [name: [in: ["Zachary", "Mike"]]],
-                   [not: [age: 37]]
-                 ]
+               clear_meta(
+                 filter_users(
+                   and: [
+                     [name: [in: ["Zachary", "Mike"]]],
+                     [not: [age: 37]]
+                   ]
+                 )
                )
     end
 
     test "gt", %{mike: mike, joe: joe} do
-      assert [^joe, ^mike] = filter_users(age: [gt: 10])
+      assert [^joe, ^mike] = clear_meta(filter_users(age: [gt: 10]))
     end
 
     test "lt", %{zachary: zachary, matthew: matthew} do
-      assert [^matthew, ^zachary] = filter_users(age: [lt: 10])
+      assert [^matthew, ^zachary] = clear_meta(filter_users(age: [lt: 10]))
     end
 
     test "boolean", %{zachary: zachary, matthew: matthew} do
-      assert [^matthew, ^zachary] = filter_users(and: [true, age: [lt: 10]])
+      assert [^matthew, ^zachary] = clear_meta(filter_users(and: [true, age: [lt: 10]]))
     end
 
     test "is_nil", %{zachary: zachary, matthew: matthew, joe: joe} do
-      assert [^joe, ^matthew, ^zachary] = filter_users(is_nil: :title)
-      assert [^joe, ^matthew, ^zachary] = filter_users(title: [is_nil: true])
+      assert [^joe, ^matthew, ^zachary] = clear_meta(filter_users(title: [is_nil: true]))
     end
   end
 
@@ -238,12 +223,12 @@ defmodule Ash.DataLayer.EtsTest do
     EtsTestUser
     |> Ash.Query.new()
     |> Ash.Query.sort(:name)
-    |> Ash.Query.filter(filter)
+    |> Ash.Query.filter(^filter)
     |> EtsApiTest.read!()
   end
 
   defp create_user(attrs, opts \\ []) do
-    %EtsTestUser{}
+    EtsTestUser
     |> Ash.Changeset.new(attrs)
     |> EtsApiTest.create!(opts)
   end

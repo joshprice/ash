@@ -1,11 +1,11 @@
 defmodule Ash.Error.Invalid.ImpossiblePath do
   @moduledoc "Used when a request expresses a dependency on another request that doesn't exist"
-  use Ash.Error
+  use Ash.Error.Exception
 
   def_ash_error([:impossible_path], class: :invalid)
 
   defimpl Ash.ErrorKind do
-    def id(_), do: Ecto.UUID.generate()
+    def id(_), do: Ash.UUID.generate()
 
     def code(_), do: "impossible_path"
 

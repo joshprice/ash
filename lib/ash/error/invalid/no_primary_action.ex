@@ -1,11 +1,11 @@
 defmodule Ash.Error.Invalid.NoPrimaryAction do
   @moduledoc "Used when an action name is provided that doesn't exist"
-  use Ash.Error
+  use Ash.Error.Exception
 
   def_ash_error([:resource, :type], class: :invalid)
 
   defimpl Ash.ErrorKind do
-    def id(_), do: Ecto.UUID.generate()
+    def id(_), do: Ash.UUID.generate()
 
     def code(_), do: "no_primary_action"
 

@@ -33,14 +33,19 @@ defmodule Ash.Engine do
   interface at the moment, though, so this documentation is just here to explain how it works
   it is not intended to give you enough information to use the engine directly.
   """
+
+  use GenServer
+
   defstruct [
     :api,
     :requests,
     :verbose?,
     :actor,
     :authorize?,
+    :changeset,
     :runner_pid,
-    :local_requests?,
+    :runner_ref,
+    local_requests: [],
     request_handlers: %{},
     active_requests: [],
     completed_requests: [],
@@ -49,9 +54,7 @@ defmodule Ash.Engine do
     errors: []
   ]
 
-  alias Ash.Engine.{Request, RequestHandler, Runner}
-
-  use GenServer
+  alias Ash.Engine.{Request, Runner}
 
   require Logger
 
@@ -59,66 +62,70 @@ defmodule Ash.Engine do
   def run([], _api, _opts), do: {:error, :no_requests_provided}
 
   def run(requests, api, opts) do
-    authorize? = opts[:authorize?] || Keyword.has_key?(opts, :actor)
+    authorize? = opts[:authorize?]
     actor = opts[:actor]
 
-    case Request.validate_requests(requests) do
-      :ok ->
-        requests =
-          Enum.map(requests, fn request ->
-            request = %{
-              request
-              | authorize?: request.authorize? and authorize?,
-                actor: actor,
-                verbose?: opts[:verbose?]
-            }
+    opts = Keyword.put(opts, :callers, [self() | Process.get(:"$callers", [])])
 
-            Request.add_initial_authorizer_state(request)
-          end)
+    # If the requests are invalid, this is a framework level error
+    Request.validate_requests!(requests)
 
-        transaction_result =
-          maybe_transact(opts, requests, fn innermost_resource ->
-            {local_requests, async_requests} = split_local_async_requests(requests)
+    requests =
+      Enum.map(requests, fn request ->
+        request = %{
+          request
+          | authorize?: request.authorize? and authorize?,
+            actor: actor,
+            verbose?: opts[:verbose?]
+        }
 
-            opts =
-              opts
-              |> Keyword.put(:requests, async_requests)
-              |> Keyword.put(:local_requests?, !Enum.empty?(local_requests))
-              |> Keyword.put(:runner_pid, self())
-              |> Keyword.put(:api, api)
+        Request.add_initial_authorizer_state(request)
+      end)
 
-            run_requests(async_requests, local_requests, opts, innermost_resource)
-          end)
+    runner_ref = make_ref()
 
-        case transaction_result do
-          {:ok, value} -> value
-          {:error, %Runner{} = runner} -> {:error, runner.errors}
-          {:error, errors} -> {:error, errors}
-        end
+    transaction_result =
+      maybe_transact(opts, requests, fn innermost_resource ->
+        {local_requests, async_requests} = split_local_async_requests(requests)
 
-      {:error, error} ->
-        {:error, error}
+        opts =
+          opts
+          |> Keyword.put(:runner_ref, runner_ref)
+          |> Keyword.put(:requests, async_requests)
+          |> Keyword.put(:local_requests, Enum.map(local_requests, & &1.path))
+          |> Keyword.put(:runner_pid, self())
+          |> Keyword.put(:api, api)
+
+        run_requests(local_requests, opts, innermost_resource)
+      end)
+
+    case transaction_result do
+      {:ok, %{errors: [], resource_notifications: resource_notifications} = result} ->
+        unsent = Ash.Notifier.notify(resource_notifications)
+
+        {:ok, %{result | resource_notifications: unsent}}
+
+      {:error, runner} ->
+        {:error, runner}
     end
   end
 
-  defp run_requests(async_requests, local_requests, opts, innermost_resource) do
-    if async_requests == [] do
-      run_and_return_or_rollback(local_requests, opts, innermost_resource)
-    else
-      Process.flag(:trap_exit, true)
-      {:ok, pid} = GenServer.start(__MODULE__, opts)
-      _ = Process.monitor(pid)
+  defp run_requests(local_requests, opts, innermost_resource) do
+    runner_ref = opts[:runner_ref]
 
-      receive do
-        {:pid_info, pid_info} ->
-          run_and_return_or_rollback(
-            local_requests,
-            opts,
-            innermost_resource,
-            pid,
-            pid_info
-          )
-      end
+    {:ok, pid} = GenServer.start(__MODULE__, opts)
+    ref = Process.monitor(pid)
+
+    receive do
+      {:pid_info, pid_info, ^runner_ref} ->
+        run_and_return_or_rollback(
+          local_requests,
+          opts,
+          innermost_resource,
+          pid,
+          pid_info,
+          ref
+        )
     end
   end
 
@@ -126,23 +133,31 @@ defmodule Ash.Engine do
          local_requests,
          opts,
          innermost_resource,
-         pid \\ nil,
-         pid_info \\ %{}
+         pid,
+         pid_info,
+         engine_monitor_ref
        ) do
-    case Runner.run(local_requests, opts[:verbose?], pid, pid_info) do
+    case Runner.run(
+           local_requests,
+           opts[:verbose?],
+           opts[:runner_ref],
+           pid,
+           pid_info,
+           engine_monitor_ref
+         ) do
       %{errors: errors} = runner when errors == [] ->
-        runner
+        {:ok, runner}
 
-      %{errors: errors} ->
-        rollback_or_return(innermost_resource, errors)
+      runner ->
+        rollback_or_return(innermost_resource, runner)
     end
   end
 
-  defp rollback_or_return(innermost_resource, errors) do
+  defp rollback_or_return(innermost_resource, runner) do
     if innermost_resource do
-      Ash.Resource.rollback(innermost_resource, errors)
+      Ash.DataLayer.rollback(innermost_resource, runner)
     else
-      {:error, errors}
+      {:error, runner}
     end
   end
 
@@ -151,41 +166,44 @@ defmodule Ash.Engine do
       requests
       |> Enum.map(& &1.resource)
       |> Enum.uniq()
-      |> Enum.filter(&Ash.Resource.data_layer_can?(&1, :transact))
+      |> Enum.filter(&Ash.DataLayer.data_layer_can?(&1, :transact))
       |> do_in_transaction(func)
     else
-      {:ok, func.(nil)}
+      func.(nil)
     end
   end
 
   defp do_in_transaction(resources, func, innnermost \\ nil)
 
   defp do_in_transaction([], func, innermost_resource) do
-    {:ok, func.(innermost_resource)}
+    func.(innermost_resource)
   end
 
   defp do_in_transaction([resource | rest], func, _innermost) do
-    Ash.Resource.transaction(resource, fn ->
+    Ash.DataLayer.transaction(resource, fn ->
       case do_in_transaction(rest, func, resource) do
         {:ok, value} ->
           value
 
         {:error, error} ->
-          Ash.Resource.rollback(resource, error)
+          Ash.DataLayer.rollback(resource, error)
       end
     end)
   end
 
   def init(opts) do
+    Process.put(:"$callers", opts[:callers])
+
     state =
       %__MODULE__{
         requests: opts[:requests],
         active_requests: Enum.map(opts[:requests], & &1.path),
         runner_pid: opts[:runner_pid],
-        local_requests?: opts[:local_requests?],
+        local_requests: opts[:local_requests],
         verbose?: opts[:verbose?] || false,
         api: opts[:api],
         actor: opts[:actor],
+        runner_ref: opts[:runner_ref],
         authorize?: opts[:authorize?] || false
       }
       |> log_engine_init()
@@ -193,20 +211,18 @@ defmodule Ash.Engine do
     {:ok, state, {:continue, :spawn_requests}}
   end
 
-  def send_wont_receive(pid, caller_path, request_path, field) do
-    GenServer.cast(pid, {:wont_receive, caller_path, request_path, field})
-  end
-
   def handle_continue(:spawn_requests, state) do
-    log(state, "Spawning request processes", :debug)
+    log(state, fn -> "Spawning request processes" end, :debug)
 
     new_state =
       Enum.reduce(state.requests, state, fn request, state ->
         {:ok, pid} =
           GenServer.start(Ash.Engine.RequestHandler,
+            callers: [self() | Process.get("$callers", [])],
             request: request,
             verbose?: state.verbose?,
             actor?: state.actor,
+            runner_ref: state.runner_ref,
             authorize?: state.authorize?,
             engine_pid: self(),
             runner_pid: state.runner_pid
@@ -225,8 +241,52 @@ defmodule Ash.Engine do
         {path, pid}
       end)
 
-    if new_state.local_requests? do
-      send(new_state.runner_pid, {:pid_info, pid_info})
+    if new_state.local_requests != [] do
+      send(new_state.runner_pid, {:pid_info, pid_info, state.runner_ref})
+    end
+
+    Enum.each(new_state.request_handlers, fn {pid, _} ->
+      send(pid, {:pid_info, pid_info})
+    end)
+
+    {:noreply, new_state}
+  end
+
+  def handle_cast({:spawn_requests, requests}, state) do
+    log(state, fn -> "Spawning request processes" end, :debug)
+
+    new_state =
+      Enum.reduce(requests, state, fn request, state ->
+        {:ok, pid} =
+          GenServer.start(Ash.Engine.RequestHandler,
+            callers: [self() | Process.get("$callers", [])],
+            request: request,
+            verbose?: state.verbose?,
+            actor?: state.actor,
+            runner_ref: state.runner_ref,
+            authorize?: state.authorize?,
+            engine_pid: self(),
+            runner_pid: state.runner_pid
+          )
+
+        Process.monitor(pid)
+
+        %{
+          state
+          | request_handlers: Map.put(state.request_handlers, pid, request.path),
+            local_requests: state.local_requests -- [request.path],
+            active_requests: state.active_requests ++ [request.path],
+            requests: state.requests ++ [request]
+        }
+      end)
+
+    pid_info =
+      Enum.into(new_state.request_handlers, %{}, fn {pid, path} ->
+        {path, pid}
+      end)
+
+    if new_state.runner_pid do
+      send(new_state.runner_pid, {:pid_info, pid_info, state.runner_ref})
     end
 
     Enum.each(new_state.request_handlers, fn {pid, _} ->
@@ -247,23 +307,46 @@ defmodule Ash.Engine do
       {:error, _pid, request} ->
         case Map.get(request, field) do
           %Request.UnresolvedField{} ->
-            send_wont_receive(request_handler_pid, receiver_path, request.path, field)
+            log(state, fn ->
+              "#{inspect(receiver_path)} won't receive #{inspect(request.path)} #{field}"
+            end)
+
+            send_or_cast(
+              request_handler_pid,
+              state.runner_pid,
+              state.runner_ref,
+              {:wont_receive, receiver_path, request.path, field}
+            )
 
           value ->
-            RequestHandler.send_field_value(
+            log(
+              state,
+              fn ->
+                "Already have #{receiver_path} #{inspect(request.path)} #{field}, sending value"
+              end
+            )
+
+            send_or_cast(
               request_handler_pid,
-              receiver_path,
-              request.path,
-              field,
-              value
+              state.runner_pid,
+              state.runner_ref,
+              {:field_value, receiver_path, request.path, field, value}
             )
         end
 
         {:noreply, state}
 
-      _ ->
+      _other ->
         {:noreply, state}
     end
+  end
+
+  def handle_cast(:log_stuck_report, state) do
+    state.request_handlers
+    |> Map.keys()
+    |> Enum.each(&GenServer.cast(&1, :log_stuck_report))
+
+    {:noreply, state}
   end
 
   def handle_cast({:local_requests_failed, _error}, state) do
@@ -276,43 +359,66 @@ defmodule Ash.Engine do
     |> maybe_shutdown()
   end
 
-  def handle_cast(:local_requests_complete, state) do
-    %{state | local_requests?: false}
-    |> maybe_shutdown()
-  end
-
   def handle_cast({:error, error, request_handler_state}, state) do
     state
-    |> log("Error received from request_handler #{inspect(error)}")
+    |> log(fn -> "Error received from request_handler #{inspect(error)}" end)
     |> move_to_error(request_handler_state.request.path)
     |> add_error(request_handler_state.request.path, error)
     |> maybe_shutdown()
   end
 
-  def handle_info({:EXIT, _pid, {:shutdown, {:error, error, request_handler_state}}}, state) do
-    state
-    |> log("Error received from request_handler #{inspect(error)}")
-    |> move_to_error(request_handler_state.request.path)
-    |> add_error(request_handler_state.request.path, error)
+  def handle_cast({:new_requests, requests}, state) do
+    requests =
+      requests
+      |> Enum.map(
+        &%{
+          &1
+          | authorize?: &1.authorize? and state.authorize?,
+            actor: state.actor,
+            verbose?: state.verbose?
+        }
+      )
+      |> Enum.map(&Request.add_initial_authorizer_state/1)
+
+    send(state.runner_pid, {state.runner_ref, {:requests, requests}})
+
+    %{state | local_requests: state.local_requests ++ Enum.map(requests, & &1.path)}
+    |> maybe_shutdown()
+  end
+
+  def handle_cast({:local_request_complete, path}, state) do
+    %{state | local_requests: state.local_requests -- [path]}
     |> maybe_shutdown()
   end
 
   def handle_info({:DOWN, _, _, _pid, {:error, error, %Request{} = request}}, state) do
     state
-    |> log("Request exited in failure #{request.name}: #{inspect(error)}")
+    |> log(fn -> "Request exited in failure #{request.name}: #{inspect(error)}" end)
     |> move_to_error(request.path)
     |> add_error(request.path, error)
     |> maybe_shutdown()
   end
 
   def handle_info({:DOWN, _, _, pid, reason}, state) do
-    {_state, _pid, request} = get_request(state, pid)
+    case get_request(state, pid) do
+      nil ->
+        {:noreply, state}
 
-    state
-    |> log("Request exited in failure #{request.name}: #{inspect(reason)}")
-    |> move_to_error(request.path)
-    |> add_error(request.path, reason)
-    |> maybe_shutdown()
+      {_state, _pid, request} ->
+        state
+        |> log(fn -> "Request exited in failure #{request.name}: #{inspect(reason)}" end)
+        |> move_to_error(request.path)
+        |> add_error(request.path, reason)
+        |> maybe_shutdown()
+    end
+  end
+
+  defp send_or_cast(request_handler_pid, runner_pid, runner_ref, message) do
+    if request_handler_pid == runner_pid do
+      send(request_handler_pid, {runner_ref, message})
+    else
+      GenServer.cast(request_handler_pid, message)
+    end
   end
 
   defp get_request(state, pid) when is_pid(pid) do
@@ -386,8 +492,8 @@ defmodule Ash.Engine do
 
   defp split_local_async_requests(requests) do
     if Enum.any?(requests, fn request ->
-         Ash.Resource.data_layer_can?(request.resource, :transact) &&
-           Ash.Resource.in_transaction?(request.resource)
+         Ash.DataLayer.data_layer_can?(request.resource, :transact) &&
+           Ash.DataLayer.in_transaction?(request.resource)
        end) do
       {requests, []}
     else
@@ -403,13 +509,14 @@ defmodule Ash.Engine do
     end
   end
 
-  defp must_be_local?(request) do
+  @doc false
+  def must_be_local?(request) do
     not request.async? ||
-      not Ash.Resource.data_layer_can?(request.resource, :async_engine)
+      not Ash.DataLayer.data_layer_can?(request.resource, :async_engine)
   end
 
-  defp maybe_shutdown(%{active_requests: [], local_requests?: false} = state) do
-    log(state, "shutting down, completion criteria reached")
+  defp maybe_shutdown(%{active_requests: [], local_requests: []} = state) do
+    log(state, fn -> "shutting down, completion criteria reached" end)
     {:stop, {:shutdown, state}, state}
   end
 
@@ -434,13 +541,13 @@ defmodule Ash.Engine do
   end
 
   defp log_engine_init(state) do
-    log(state, "Initializing Engine with #{Enum.count(state.requests)} requests.")
+    log(state, fn -> "Initializing Engine with #{Enum.count(state.requests)} requests." end)
   end
 
   defp log(state, message, level \\ :info)
 
   defp log(%{verbose?: true} = state, message, level) do
-    Logger.log(level, "Engine: " <> message)
+    Logger.log(level, fn -> ["Engine: ", message.()] end)
 
     state
   end
@@ -449,10 +556,13 @@ defmodule Ash.Engine do
     state
   end
 
-  defp add_error(state, path, error) do
-    path = List.wrap(path)
+  defp add_error(state, path, errors) when is_list(errors) do
+    Enum.reduce(errors, state, &add_error(&2, path, &1))
+  end
+
+  defp add_error(state, _path, error) do
     error = Ash.Error.to_ash_error(error)
 
-    %{state | errors: [Map.put(error, :path, path) | state.errors]}
+    %{state | errors: [error | state.errors]}
   end
 end

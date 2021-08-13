@@ -2,7 +2,12 @@ defmodule Ash.Test.Filter.FilterTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  import Ash.Changeset
+  import Ash.Test.Helpers
+
   alias Ash.Filter
+
+  require Ash.Query
 
   defmodule Profile do
     @moduledoc false
@@ -13,14 +18,15 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
+      read :read
+      create :create
+      update :update
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :bio, :string
+      attribute :private, :string, private?: true
     end
 
     relationships do
@@ -37,15 +43,16 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     actions do
-      read :default
-      create :default
-      update :default
+      read :read
+      create :create
+      update :update
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :name, :string
       attribute :allow_second_author, :boolean
+      attribute :special, :boolean
     end
 
     relationships do
@@ -66,15 +73,20 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     actions do
-      read :default
+      read :read
 
-      create :default
-      update :default
+      create :create
+      update :update
     end
 
     relationships do
-      belongs_to :source_post, Ash.Test.Filter.FilterTest.Post, primary_key?: true
-      belongs_to :destination_post, Ash.Test.Filter.FilterTest.Post, primary_key?: true
+      belongs_to :source_post, Ash.Test.Filter.FilterTest.Post,
+        primary_key?: true,
+        required?: true
+
+      belongs_to :destination_post, Ash.Test.Filter.FilterTest.Post,
+        primary_key?: true,
+        required?: true
     end
   end
 
@@ -87,24 +99,32 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     actions do
-      read :default
+      read :read
 
-      create :default
+      create :create
 
-      update :default
+      update :update
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :title, :string
       attribute :contents, :string
       attribute :points, :integer
+      attribute :approved_at, :utc_datetime
+      attribute :category, :ci_string
     end
 
     relationships do
       belongs_to :author1, User,
         destination_field: :id,
         source_field: :author1_id
+
+      belongs_to :special_author1, User,
+        destination_field: :id,
+        source_field: :author1_id,
+        define_field?: false,
+        filter: expr(special == true)
 
       belongs_to :author2, User,
         destination_field: :id,
@@ -130,10 +150,10 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     actions do
-      read :default
-      create :default
+      read :read
+      create :create
 
-      destroy :default do
+      destroy :destroy do
         soft? true
 
         change set_attribute(:deleted_at, &DateTime.utc_now/0)
@@ -141,7 +161,7 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     attributes do
-      attribute :id, :uuid, primary_key?: true, default: &Ecto.UUID.generate/0
+      uuid_primary_key :id
       attribute :deleted_at, :utc_datetime
     end
   end
@@ -159,7 +179,63 @@ defmodule Ash.Test.Filter.FilterTest do
     end
   end
 
-  import Ash.Changeset
+  describe "predicate optimization" do
+    # Testing against the stringified query may be a bad idea, but its a quick win and we
+    # can switch to actually checking the structure if this bites us
+    test "equality simplifies to `in`" do
+      stringified_query =
+        Post
+        |> Ash.Query.filter(title == "foo" or title == "bar")
+        |> inspect()
+
+      assert stringified_query =~ ~S(title in ["bar", "foo"])
+    end
+
+    test "in with equality simplifies to `in`" do
+      stringified_query =
+        Post
+        |> Ash.Query.filter(title in ["foo", "bar", "baz"] or title == "bar")
+        |> inspect()
+
+      assert stringified_query =~ ~S(title in ["bar", "baz", "foo"])
+    end
+
+    test "in with non-equality simplifies to `in`" do
+      stringified_query =
+        Post
+        |> Ash.Query.filter(title in ["foo", "bar", "baz"] and title != "bar")
+        |> inspect()
+
+      assert stringified_query =~ ~S(title in ["baz", "foo"])
+    end
+
+    test "in with or-in simplifies to `in`" do
+      stringified_query =
+        Post
+        |> Ash.Query.filter(title in ["foo", "bar"] or title in ["bar", "baz"])
+        |> inspect()
+
+      assert stringified_query =~ ~S(title in ["bar", "baz", "foo"])
+    end
+
+    test "in with and-in simplifies to `in` when multiple values overlap" do
+      stringified_query =
+        Post
+        |> Ash.Query.filter(title in ["foo", "bar", "baz"] and title in ["bar", "baz", "bif"])
+        |> inspect()
+
+      assert stringified_query =~ ~S(title in ["bar", "baz"])
+    end
+
+    test "in with and-in simplifies to `eq` when one value overlaps" do
+      stringified_query =
+        Post
+        |> Ash.Query.filter(title in ["foo", "bar"] and title in ["bar", "baz", "bif"])
+        |> inspect()
+
+      assert stringified_query =~ ~S(title == "bar")
+    end
+  end
 
   describe "simple attribute filters" do
     setup do
@@ -179,21 +255,23 @@ defmodule Ash.Test.Filter.FilterTest do
     test "single filter field", %{post1: post1} do
       assert [^post1] =
                Post
-               |> Ash.Query.filter(title: post1.title)
+               |> Ash.Query.filter(title == ^post1.title)
                |> Api.read!()
+               |> clear_meta()
     end
 
     test "multiple filter field matches", %{post1: post1} do
       assert [^post1] =
                Post
-               |> Ash.Query.filter(title: post1.title, contents: post1.contents)
+               |> Ash.Query.filter(title == ^post1.title and contents == ^post1.contents)
                |> Api.read!()
+               |> clear_meta()
     end
 
     test "no field matches" do
       assert [] =
                Post
-               |> Ash.Query.filter(title: "no match")
+               |> Ash.Query.filter(title == "no match")
                |> Api.read!()
     end
 
@@ -203,7 +281,7 @@ defmodule Ash.Test.Filter.FilterTest do
     } do
       assert [] =
                Post
-               |> Ash.Query.filter(title: post1.title, contents: post2.contents)
+               |> Ash.Query.filter(title == ^post1.title and contents == ^post2.contents)
                |> Api.read!()
     end
 
@@ -213,14 +291,16 @@ defmodule Ash.Test.Filter.FilterTest do
     } do
       assert [^post1] =
                Post
-               |> Ash.Query.filter(points: [lt: 2])
+               |> Ash.Query.filter(points < 2)
                |> Api.read!()
+               |> clear_meta()
 
       assert [^post1, ^post2] =
                Post
-               |> Ash.Query.filter(points: [lt: 3])
+               |> Ash.Query.filter(points < 3)
                |> Ash.Query.sort(points: :asc)
                |> Api.read!()
+               |> clear_meta()
     end
 
     test "greater than works", %{
@@ -229,14 +309,16 @@ defmodule Ash.Test.Filter.FilterTest do
     } do
       assert [^post2] =
                Post
-               |> Ash.Query.filter(points: [gt: 1])
+               |> Ash.Query.filter(points > 1)
                |> Api.read!()
+               |> clear_meta()
 
       assert [^post1, ^post2] =
                Post
-               |> Ash.Query.filter(points: [gt: 0])
+               |> Ash.Query.filter(points > 0)
                |> Ash.Query.sort(points: :asc)
                |> Api.read!()
+               |> clear_meta()
     end
   end
 
@@ -278,7 +360,7 @@ defmodule Ash.Test.Filter.FilterTest do
 
       user2 =
         User
-        |> new(%{name: "broseph"})
+        |> new(%{name: "broseph", special: false})
         |> replace_relationship(:posts, [post2])
         |> Api.create!()
 
@@ -300,32 +382,39 @@ defmodule Ash.Test.Filter.FilterTest do
       }
     end
 
-    test "filtering on a has_one relationship", %{profile2: profile2, user2: user2} do
-      assert [^user2] =
+    test "filtering on a has_one relationship", %{profile2: profile2, user2: %{id: user2_id}} do
+      assert [%{id: ^user2_id}] =
                User
-               |> Ash.Query.filter(profile: profile2.id)
+               |> Ash.Query.filter(profile == ^profile2.id)
                |> Api.read!()
     end
 
-    test "filtering on a belongs_to relationship", %{profile1: profile1, user1: user1} do
-      assert [^profile1] =
+    test "filtering on a belongs_to relationship", %{profile1: %{id: id}, user1: user1} do
+      assert [%{id: ^id}] =
                Profile
-               |> Ash.Query.filter(user: user1.id)
+               |> Ash.Query.filter(user == ^user1.id)
                |> Api.read!()
     end
 
-    test "filtering on a has_many relationship", %{user2: user2, post2: post2} do
-      assert [^user2] =
+    test "filtering on a has_many relationship", %{user2: %{id: user2_id}, post2: post2} do
+      assert [%{id: ^user2_id}] =
                User
-               |> Ash.Query.filter(posts: post2.id)
+               |> Ash.Query.filter(posts == ^post2.id)
                |> Api.read!()
     end
 
-    test "filtering on a many_to_many relationship", %{post4: post4, post3: post3} do
-      assert [^post4] =
+    test "filtering on a many_to_many relationship", %{post4: %{id: post4_id}, post3: post3} do
+      assert [%{id: ^post4_id}] =
                Post
-               |> Ash.Query.filter(related_posts: post3.id)
+               |> Ash.Query.filter(related_posts == ^post3.id)
                |> Api.read!()
+    end
+
+    test "relationship filters are honored when filtering on relationships", %{post2: post} do
+      post = Api.load!(post, [:special_author1, :author1])
+
+      assert post.author1
+      refute post.special_author1
     end
   end
 
@@ -369,24 +458,41 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     test "can detect a more complicated scenario" do
-      filter = Filter.parse!(Post, or: [points: [in: [1, 2, 3]], points: 4, points: 5])
+      filter = Filter.parse!(Post, or: [[points: [in: [1, 2, 3]]], [points: 4], [points: 5]])
 
-      candidate = Filter.parse!(Post, or: [points: 1, points: 3, points: 5])
+      candidate = Filter.parse!(Post, or: [[points: 1], [points: 3], [points: 5]])
 
       assert Filter.strict_subset_of?(filter, candidate)
     end
 
-    test "understands unrelated negations" do
-      filter = Filter.parse!(Post, or: [points: [in: [1, 2, 3]], points: 4, points: 5])
+    test "can detect less than and greater than closing in on a single value" do
+      filter = Filter.parse!(Post, points: [greater_than: 1, less_than: 3])
 
-      candidate = Filter.parse!(Post, or: [points: 1, points: 3, points: 5], not: [points: 7])
+      candidate = Filter.parse!(Post, points: 2)
+
+      assert Filter.strict_subset_of?(filter, candidate)
+    end
+
+    test "doesnt have false positives on less than and greater than closing in on a single value" do
+      filter = Filter.parse!(Post, points: [greater_than: 1, less_than: 3])
+
+      candidate = Filter.parse!(Post, points: 4)
+
+      refute Filter.strict_subset_of?(filter, candidate)
+    end
+
+    test "understands unrelated negations" do
+      filter = Filter.parse!(Post, or: [[points: [in: [1, 2, 3]]], [points: 4], [points: 5]])
+
+      candidate =
+        Filter.parse!(Post, or: [[points: 1], [points: 3], [points: 5]], not: [points: 7])
 
       assert Filter.strict_subset_of?(filter, candidate)
     end
 
     test "understands relationship filter subsets" do
-      id1 = Ecto.UUID.generate()
-      id2 = Ecto.UUID.generate()
+      id1 = Ash.UUID.generate()
+      id2 = Ash.UUID.generate()
       filter = Filter.parse!(Post, author1: [id: [in: [id1, id2]]])
 
       candidate = Filter.parse!(Post, author1: id1)
@@ -395,13 +501,27 @@ defmodule Ash.Test.Filter.FilterTest do
     end
 
     test "understands relationship filter subsets when a value coincides with the join field" do
-      id1 = Ecto.UUID.generate()
-      id2 = Ecto.UUID.generate()
+      id1 = Ash.UUID.generate()
+      id2 = Ash.UUID.generate()
       filter = Filter.parse!(Post, author1: [id: [in: [id1, id2]]])
 
       candidate = Filter.parse!(Post, author1_id: id1)
 
       assert Filter.strict_subset_of?(filter, candidate)
+    end
+  end
+
+  describe "parse_input" do
+    test "parse_input works when no private attributes are used" do
+      Ash.Filter.parse_input!(Profile, bio: "foo")
+    end
+
+    test "parse_input fails when a private attribute is used" do
+      Ash.Filter.parse!(Profile, private: "private")
+
+      assert_raise(Ash.Error.Query.NoSuchAttributeOrRelationship, fn ->
+        Ash.Filter.parse_input!(Profile, private: "private")
+      end)
     end
   end
 
@@ -422,6 +542,87 @@ defmodule Ash.Test.Filter.FilterTest do
       |> Api.destroy()
 
       assert [] = Api.read!(SoftDeletePost)
+    end
+  end
+
+  describe "contains/2" do
+    test "works for simple strings" do
+      Post
+      |> new(%{title: "foobar"})
+      |> Api.create!()
+
+      Post
+      |> new(%{title: "bazbuz"})
+      |> Api.create!()
+
+      assert [%{title: "foobar"}] =
+               Post
+               |> Ash.Query.filter(contains(title, "oba"))
+               |> Api.read!()
+    end
+
+    test "works for simple strings with a case insensitive search term" do
+      Post
+      |> new(%{title: "foobar"})
+      |> Api.create!()
+
+      Post
+      |> new(%{title: "bazbuz"})
+      |> Api.create!()
+
+      assert [%{title: "foobar"}] =
+               Post
+               |> Ash.Query.filter(contains(title, ^%Ash.CiString{string: "OBA"}))
+               |> Api.read!()
+    end
+
+    test "works for case insensitive strings" do
+      Post
+      |> new(%{category: "foobar"})
+      |> Api.create!()
+
+      Post
+      |> new(%{category: "bazbuz"})
+      |> Api.create!()
+
+      assert [%{category: %Ash.CiString{string: "foobar"}}] =
+               Post
+               |> Ash.Query.filter(contains(category, "OBA"))
+               |> Api.read!()
+    end
+  end
+
+  describe "calls in filters" do
+    test "calls are evaluated and can be used in predicates" do
+      post1 =
+        Post
+        |> new(%{title: "title1", contents: "contents1", points: 2})
+        |> Api.create!()
+
+      post_id = post1.id
+
+      assert [%Post{id: ^post_id}] =
+               Post
+               |> Ash.Query.filter(points + 1 == 3)
+               |> Api.read!()
+    end
+
+    test "function calls are evaluated properly" do
+      post1 =
+        Post
+        |> new(%{title: "title1", approved_at: Timex.shift(Timex.now(), weeks: -1)})
+        |> Api.create!()
+
+      Post
+      |> new(%{title: "title1", approved_at: Timex.shift(Timex.now(), weeks: -4)})
+      |> Api.create!()
+
+      post_id = post1.id
+
+      assert [%Post{id: ^post_id}] =
+               Post
+               |> Ash.Query.filter(approved_at > ago(2, :week))
+               |> Api.read!()
     end
   end
 end
