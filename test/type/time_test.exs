@@ -21,6 +21,7 @@ defmodule Ash.Test.Type.TimeTest do
 
       attribute :time_a, :time
       attribute :time_b, :time, allow_nil?: false
+      attribute :time_c, :time, allow_nil?: false, default: ~T[18:15:00]
     end
   end
 
@@ -53,5 +54,16 @@ defmodule Ash.Test.Type.TimeTest do
 
     assert post.time_a == ~T[08:30:00]
     assert post.time_b == ~T[15:45:30]
+  end
+
+  test "it handles default values" do
+    post =
+      Post
+      |> new(%{
+        time_b: ~T[15:45:30]
+      })
+      |> Api.create!()
+
+    assert post.time_c == ~T[18:15:00]
   end
 end
