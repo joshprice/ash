@@ -201,7 +201,7 @@ defmodule Ash.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:spark, "~> 0.1.5"},
+      {:spark, "~> 0.1 and >= 0.1.6"},
       {:ecto, "~> 3.7"},
       {:ets, "~> 0.8.0"},
       {:decimal, "~> 2.0"},
@@ -210,7 +210,6 @@ defmodule Ash.MixProject do
       {:timex, ">= 3.0.0"},
       {:comparable, "~> 1.0"},
       {:jason, ">= 1.0.0"},
-      {:sourceror, "~> 0.9"},
       {:earmark, "~> 1.4", optional: true},
       {:stream_data, "~> 0.5.0"},
       # Dev/Test dependencies
